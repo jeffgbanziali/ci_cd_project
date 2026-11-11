@@ -7,11 +7,10 @@ on:
 jobs:
   deploy:
     needs: [test]
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Build Docker Container
         run: |
           docker build -t financial-data-pipeline:latest .
