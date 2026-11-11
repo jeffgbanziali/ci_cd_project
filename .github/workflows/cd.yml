@@ -1,0 +1,22 @@
+name: CD Deployment
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker Container
+        run: |
+          docker build -t financial-data-pipeline:latest .
+
+      - name: Deploy Local Stack
+        run: |
+          docker compose up -d
+          echo "Services déployés et prêts pour l'ingestion."
