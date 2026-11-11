@@ -1,8 +1,11 @@
 import pandas as pd
 
 def flag_high_value_transactions(df: pd.DataFrame, threshold: float = 5000.0) -> pd.DataFrame:
-    # Simulation volontaire d'une régression pour la capture du rapport
-    raise ValueError("Validation Error: invalid transaction amount schema detected")
+    """Fonction pure: ajoute une colonne is_high_value sans muter df."""
+    res = df.copy()
+    res["montant"] = pd.to_numeric(res["montant"])
+    res["is_high_value"] = res["montant"] > threshold
+    return res
 
 def sum_amount_by_iban_origine(df: pd.DataFrame) -> pd.DataFrame:
     """Fonction pure: calcule la somme envoyée par iban_origine."""
