@@ -14,22 +14,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify Python Environment
+      - name: Verify Python 3.11 Environment
         shell: powershell
         run: |
-          python --version
-          python -m pip --version
+          py -3.11 --version
+          py -3.11 -m pip --version
 
       - name: Install dependencies
         shell: powershell
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          py -3.11 -m pip install --upgrade pip
+          py -3.11 -m pip install -r requirements.txt
 
       - name: Code Quality (Ruff)
         shell: powershell
         run: |
-          python -m ruff check .
+          py -3.11 -m ruff check .
 
       - name: Run Pytest with Coverage
         shell: powershell
@@ -40,4 +40,4 @@ jobs:
           S3_SECRET_KEY: minioadminpassword
           S3_BUCKET: transactions-bucket
         run: |
-          python -m pytest tests/ --cov=src --cov-report=term-missing --cov-fail-under=80
+          py -3.11 -m pytest tests/ --cov=src --cov-report=term-missing --cov-fail-under=80
