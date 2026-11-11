@@ -8,7 +8,7 @@ def flag_high_value_transactions(df: pd.DataFrame, threshold: float = 5000.0) ->
     """Ajoute is_high_value (montant STRICTEMENT > seuil) sans muter df."""
     res = df.copy()
     res["montant"] = pd.to_numeric(res["montant"])
-    res["is_high_value"] = res["montant"] > threshold
+    res["is_high_value"] = res["montant"] >= threshold
     return res
 
 
