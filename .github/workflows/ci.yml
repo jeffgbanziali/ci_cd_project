@@ -8,54 +8,30 @@ on:
 
 jobs:
   test:
-    runs-on: self-hosted
-
-    services:
-      postgres:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_DB: financial_db
-          POSTGRES_USER: pipeline_user
-          POSTGRES_PASSWORD: pipeline_password
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-
-      minio:
-        image: minio/minio:latest
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadminpassword
-        ports:
-          - 9000:9000
-        options: >-
-          server /data
+    runs-on: [self-hosted, Windows]
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/zsetup-python@v5
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Code Quality (Ruff)
-        run: ruff check .
+        run: |
+          ruff check .
 
-      - name: Run Pytest Suite with Coverage
+      - name: Run Pytest with Coverage
         env:
-          DB_URL: postgresql://pipeline_user:pipeline_password@localhost:5432/financial_db
+          DB_URL: sqlite:///test_ci.db
           S3_ENDPOINT: http://localhost:9000
           S3_ACCESS_KEY: minioadmin
           S3_SECRET_KEY: minioadminpassword
