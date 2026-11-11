@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: pipeline_test
+          POSTGRES_USER: pipeline
+          POSTGRES_PASSWORD: pipeline
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pipeline -d pipeline_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+
+    env:
+      PG_URL: postgresql://pipeline:pipeline@localhost:5432/pipeline_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Installer les dépendances
+        run: pip install -r requirements-dev.txt
+
+      - name: Qualité du code (ruff)
+        run: ruff check .
+
+      - name: Démarrer le service S3 (SeaweedFS)
+        run: |
+          docker compose up -d s3
+          timeout 90 sh -c 'until curl -s -o /dev/null http://localhost:9000; do sleep 2; done'
+          echo "S3 disponible"
+
+      - name: Tests unitaires + intégration (vraie base Postgres + vrai S3)
+        env:
+          TEST_DB_URL: ${{ env.PG_URL }}
+          TEST_S3_ENDPOINT: http://localhost:9000
+        run: pytest -v --cov=src --cov-report=term-missing --cov-fail-under=80
+
+      - name: Pipeline complète avec PANNES SIMULÉES (retry DB + S3)
+        env:
+          DB_URL: ${{ env.PG_URL }}
+          S3_ENDPOINT: http://localhost:9000
+          SIMULATE_DB_FAILURES: "2"
+          SIMULATE_S3_FAILURES: "2"
+          RETRY_WAIT_SECONDS: "0.5"
+        run: |
+          set -o pipefail
+          python -c "from src.db.connection import reset_db; reset_db()"
+          python -m src.pipeline.main 2>&1 | tee run1.log
+          grep -q "3 traité(s), 0 ignoré(s)" run1.log
+          grep -q "panne temporaire 'db'" run1.log
+          grep -q "panne temporaire 's3'" run1.log
+
+      - name: Idempotence (relance = aucun fichier retraité)
+        env:
+          DB_URL: ${{ env.PG_URL }}
+          S3_ENDPOINT: http://localhost:9000
+        run: |
+          set -o pipefail
+          python -m src.pipeline.main 2>&1 | tee run2.log
+          grep -q "0 traité(s), 3 ignoré(s)" run2.log
+
+      - name: Logs des services en cas d'échec
+        if: failure()
+        run: docker compose logs s3 | tail -50

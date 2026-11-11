@@ -1,0 +1,46 @@
+# Production (VM) : base + S3 + scheduler qui traite régulièrement les nouveaux fichiers.
+# Déployé automatiquement par .github/workflows/cd.yml
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: financial_db
+      POSTGRES_USER: pipeline_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?mot de passe requis}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pipeline_user -d financial_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  s3:
+    image: chrislusf/seaweedfs:latest
+    restart: unless-stopped
+    command: "server -s3 -dir=/data"
+    ports:
+      - "9000:8333"   # dépôt des CSV dans le bucket (à protéger par le pare-feu de la VM)
+    volumes:
+      - s3data:/data
+
+  scheduler:
+    image: ${PIPELINE_IMAGE:?image requise}
+    restart: unless-stopped
+    command: ["--schedule", "${SCHEDULE_SECONDS:-300}"]   # un cycle toutes les 5 minutes
+    depends_on:
+      postgres:
+        condition: service_healthy
+      s3:
+        condition: service_started
+    environment:
+      DB_URL: postgresql://pipeline_user:${POSTGRES_PASSWORD}@postgres:5432/financial_db
+      S3_ENDPOINT: http://s3:8333
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadminpassword
+      S3_BUCKET: transactions-bucket
+
+volumes:
+  pgdata:
+  s3data:
