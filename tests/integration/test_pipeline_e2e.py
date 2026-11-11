@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy.exc import OperationalError
 from unittest.mock import patch, MagicMock
 from src.db.connection import init_db, SessionLocal
-from src.db.models import Transaction, ProcessedFile
+from src.db.models import ProcessedFile
 from src.pipeline.loader_db import process_and_load_content
 
 @pytest.fixture(autouse=True)
