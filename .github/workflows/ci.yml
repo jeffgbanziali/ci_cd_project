@@ -14,22 +14,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
+      - name: Verify Python Environment
+        shell: powershell
+        run: |
+          python --version
+          python -m pip --version
 
       - name: Install dependencies
+        shell: powershell
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt
 
       - name: Code Quality (Ruff)
+        shell: powershell
         run: |
-          ruff check .
+          python -m ruff check .
 
       - name: Run Pytest with Coverage
+        shell: powershell
         env:
           DB_URL: sqlite:///test_ci.db
           S3_ENDPOINT: http://localhost:9000
@@ -37,4 +40,4 @@ jobs:
           S3_SECRET_KEY: minioadminpassword
           S3_BUCKET: transactions-bucket
         run: |
-          pytest tests/ --cov=src --cov-report=term-missing --cov-fail-under=80
+          python -m pytest tests/ --cov=src --cov-report=term-missing --cov-fail-under=80
