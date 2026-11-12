@@ -18,7 +18,7 @@ env:
 jobs:
 
   # ==========================================
-  # 1. VALIDATION
+  # 1. VALIDATION DE L'ENVIRONNEMENT
   # ==========================================
   validate:
     name: Validate Environment
@@ -93,32 +93,33 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           if (-not (Test-Path "Dockerfile")) {
-            throw "Dockerfile introuvable."
+            throw "Dockerfile introuvable à la racine."
           }
 
           if (-not (Test-Path "docker-compose.prod.yml")) {
-            throw "docker-compose.prod.yml introuvable."
+            throw "docker-compose.prod.yml introuvable à la racine."
           }
 
           Write-Host "Fichiers de production vérifiés."
 
 
   # ==========================================
-  # 2. BUILD ET EXPORT DOCKER
+  # 2. BUILD + TRANSFERT + DEPLOIEMENT
   # ==========================================
-  build-image:
-    name: Build Docker Image
+  deploy:
+    name: Build and Deploy to Azure
     runs-on: [self-hosted, Windows, X64]
     needs: validate
 
-    outputs:
-      image: ${{ needs.validate.outputs.image }}
-      tag: ${{ needs.validate.outputs.tag }}
+    environment: production
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # --------------------------------------
+      # BUILD DOCKER
+      # --------------------------------------
       - name: Build Docker image
         shell: powershell
         env:
@@ -138,6 +139,9 @@ jobs:
 
           docker images "$env:IMAGE"
 
+      # --------------------------------------
+      # EXPORT IMAGE
+      # --------------------------------------
       - name: Export Docker image
         shell: powershell
         env:
@@ -159,37 +163,11 @@ jobs:
             throw "image.tar introuvable."
           }
 
-          Write-Host "Image exportée."
+          Write-Host "Image Docker exportée."
 
-      - name: Upload Docker image artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: financial-pipeline-image
-          path: image.tar
-          if-no-files-found: error
-          retention-days: 1
-
-
-  # ==========================================
-  # 3. TRANSFERT ET DEPLOIEMENT AZURE
-  # ==========================================
-  deploy:
-    name: Deploy to Azure VPS
-    runs-on: [self-hosted, Windows, X64]
-    needs: [validate, build-image]
-
-    environment: production
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download Docker image
-        uses: actions/download-artifact@v4
-        with:
-          name: financial-pipeline-image
-          path: .
-
+      # --------------------------------------
+      # INSTALLATION PARAMIKO
+      # --------------------------------------
       - name: Install Paramiko
         shell: powershell
         run: |
@@ -201,6 +179,9 @@ jobs:
             throw "Installation de Paramiko échouée."
           }
 
+      # --------------------------------------
+      # TRANSFERT ET DEPLOIEMENT AZURE
+      # --------------------------------------
       - name: Transfer image and deploy
         shell: powershell
         env:
@@ -217,9 +198,9 @@ jobs:
           @'
           import os
           import sys
-          import paramiko
           import shlex
           import time
+          import paramiko
 
           host = os.environ["VM_HOST"]
           user = os.environ["VM_USER"]
@@ -231,22 +212,22 @@ jobs:
           postgres_password = os.environ["POSTGRES_PASSWORD"]
 
           client = paramiko.SSHClient()
+
+          # Accepte automatiquement la première clé d'hôte.
+          # Pour la production, il est préférable de vérifier
+          # et épingler la clé SSH de la VM.
           client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-          def run_command(command, input_data=None):
+          def run_command(command):
               stdin, stdout, stderr = client.exec_command(
                   command,
                   timeout=900
               )
 
-              if input_data is not None:
-                  stdin.write(input_data)
-                  stdin.flush()
-                  stdin.channel.shutdown_write()
+              exit_code = stdout.channel.recv_exit_status()
 
               output = stdout.read().decode(errors="replace")
               error = stderr.read().decode(errors="replace")
-              exit_code = stdout.channel.recv_exit_status()
 
               if output:
                   print(output)
@@ -258,6 +239,9 @@ jobs:
                   )
 
               return output
+
+          def dotenv_quote(value):
+              return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
           try:
               print("Connexion à la VM Azure...")
@@ -271,11 +255,14 @@ jobs:
                   allow_agent=False
               )
 
-              # Création du répertoire de déploiement
               safe_dir = shlex.quote(app_dir)
+
+              # 1. Préparer le répertoire
               run_command("mkdir -p " + safe_dir)
 
-              # Transfert des fichiers
+              # 2. Transférer les fichiers
+              print("Transfert de l'image Docker et du Compose...")
+
               sftp = client.open_sftp()
 
               sftp.put(
@@ -288,10 +275,7 @@ jobs:
                   app_dir + "/docker-compose.prod.yml"
               )
 
-              # Création du fichier .env
-              def dotenv_quote(value):
-                  return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
-
+              # 3. Générer le fichier .env
               env_content = (
                   "POSTGRES_PASSWORD=" + dotenv_quote(postgres_password) + "\n"
                   "PIPELINE_IMAGE=" + dotenv_quote(image + ":" + tag) + "\n"
@@ -301,23 +285,23 @@ jobs:
                   "S3_BUCKET=transactions-bucket\n"
               )
 
-              with sftp.file(app_dir + "/.env", "w") as f:
-                  f.write(env_content)
+              with sftp.file(app_dir + "/.env", "w") as env_file:
+                  env_file.write(env_content)
 
               sftp.chmod(app_dir + "/.env", 0o600)
               sftp.close()
 
-              print("Fichiers transférés.")
+              print("Transfert terminé.")
 
-              # Chargement de l'image Docker sur Azure
+              # 4. Charger l'image Docker sur Azure
+              print("Chargement de l'image Docker sur Azure...")
+
               run_command(
                   "cd " + safe_dir +
                   " && docker load -i image.tar"
               )
 
-              print("Image Docker chargée.")
-
-              # Validation de la configuration
+              # 5. Vérifier la configuration Compose
               compose = (
                   "docker compose -p financial-pipeline "
                   "-f docker-compose.prod.yml"
@@ -328,7 +312,11 @@ jobs:
                   " && " + compose + " config -q"
               )
 
-              # Démarrage des services
+              print("Configuration Docker Compose valide.")
+
+              # 6. Déployer les services
+              print("Démarrage des services...")
+
               run_command(
                   "cd " + safe_dir +
                   " && " + compose + " up -d --no-build"
@@ -336,12 +324,15 @@ jobs:
 
               time.sleep(10)
 
-              # Vérification
+              # 7. Vérifier les conteneurs
+              print("Vérification des conteneurs...")
+
               run_command(
                   "cd " + safe_dir +
                   " && " + compose + " ps"
               )
 
+              # 8. Vérifier les logs du scheduler
               run_command(
                   "cd " + safe_dir +
                   " && " + compose + " logs --tail=40 scheduler"
@@ -359,6 +350,9 @@ jobs:
             throw "Le déploiement Azure a échoué."
           }
 
+      # --------------------------------------
+      # RESUME DU DEPLOIEMENT
+      # --------------------------------------
       - name: Deployment summary
         if: success()
         shell: powershell
@@ -370,5 +364,5 @@ jobs:
           Write-Host "DEPLOIEMENT REUSSI"
           Write-Host "Image : $env:IMAGE"
           Write-Host "Tag : $env:TAG"
-          Write-Host "Azure : ${{ secrets.VM_HOST }}"
+          Write-Host "Serveur : ${{ secrets.VM_HOST }}"
           Write-Host "======================================"
