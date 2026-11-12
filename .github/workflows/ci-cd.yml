@@ -599,41 +599,16 @@ jobs:
           if (docker images -q financial-data-pipeline:ci) { docker rmi -f financial-data-pipeline:ci }
           exit 0
 
-  terraform-check:
-    name: Terraform Validation
-    runs-on: self-hosted
-
-    defaults:
-      run:
-        working-directory: terraform
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Terraform Format
-        run: terraform fmt -check -recursive
-
-      - name: Terraform Init
-        run: terraform init -backend=false
-
-      - name: Terraform Validate
-        run: terraform validate
-
-
   # =====================================================
-  # JOB 10 - BUILD, TRANSFER AND TERRAFORM DEPLOYMENT
+  # JOB 9 - BUILD, TRANSFER AND DOCKER COMPOSE DEPLOYMENT
   # =====================================================
   deploy:
-    name: "10 - Deploy to production with Terraform"
+    name: "9 - Deploy to production with Docker Compose"
     runs-on: [self-hosted, Windows, X64]
-    needs: [docker-build, terraform-check]
+    needs: docker-build
     if: >-
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      github.event_name == 'workflow_dispatch' ||
+      (github.ref == 'refs/heads/main' && github.event_name == 'push')
     timeout-minutes: 40
     environment: production
 
@@ -642,7 +617,6 @@ jobs:
       VM_USER: ${{ secrets.VM_USER }}
       VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
       PROD_POSTGRES_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
-      TF_VAR_ssh_password: ${{ secrets.VM_PASSWORD }}
       VM_APP_DIR: /home/ubuntu/financial-pipeline/runtime
       IMAGE_NAME: financial-pipeline
       IMAGE_SHA: ${{ github.sha }}
@@ -653,8 +627,6 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
 
 
       - name: Build and export Docker image
@@ -767,9 +739,13 @@ jobs:
 
               print("Image et configuration transférées.")
 
-              # Charger l'image uniquement : Terraform exécute ensuite le docker compose up.
+              # Charger l'image puis appliquer directement le déploiement Docker Compose.
               run_remote("cd " + safe_dir + " && docker load -i image.tar")
               print("Image chargée sur la VM.")
+              run_remote("cd " + safe_dir + " && docker compose -p financial-pipeline -f docker-compose.prod.yml config --quiet")
+              run_remote("cd " + safe_dir + " && docker compose -p financial-pipeline -f docker-compose.prod.yml up -d --no-build")
+              run_remote("cd " + safe_dir + " && docker compose -p financial-pipeline -f docker-compose.prod.yml ps")
+              print("Déploiement Docker Compose terminé.")
           finally:
               client.close()
           '@ | Set-Content -Path transfer_production.py -Encoding UTF8
@@ -777,62 +753,6 @@ jobs:
           python transfer_production.py
           if ($LASTEXITCODE -ne 0) {
             throw "Le transfert ou le chargement de l'image sur la VM a échoué."
-          }
-
-      - name: Initialize persistent Terraform backend
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          New-Item -ItemType Directory -Force `
-            -Path "C:\TerraformState\financial-pipeline" | Out-Null
-
-          terraform -chdir=terraform init -input=false
-          if ($LASTEXITCODE -ne 0) {
-            throw "terraform init a échoué."
-          }
-
-      - name: Create and inspect Terraform plan
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          terraform -chdir=terraform plan `
-            -input=false `
-            -out=tfplan `
-            "-var=ssh_host=$env:VM_HOST" `
-            "-var=ssh_user=$env:VM_USER" `
-            "-var=deploy_revision=$env:IMAGE_SHA"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "terraform plan a échoué."
-          }
-
-          terraform -chdir=terraform show -json tfplan |
-            Out-File -FilePath terraform-plan.json -Encoding utf8
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Impossible de lire le plan Terraform."
-          }
-
-          $plan = Get-Content -Raw terraform-plan.json | ConvertFrom-Json
-          $unexpectedChanges = @(
-            $plan.resource_changes | Where-Object {
-              $_.address -ne "terraform_data.production_deployment" -and
-              ($_.change.actions -join ",") -ne "no-op"
-            }
-          )
-
-          if ($unexpectedChanges.Count -gt 0) {
-            $addresses = ($unexpectedChanges | ForEach-Object { $_.address }) -join ", "
-            throw "Déploiement bloqué : changements Terraform inattendus : $addresses"
-          }
-
-          Write-Host "Plan accepté : seul terraform_data.production_deployment peut être créé ou remplacé."
-
-      - name: Apply Terraform deployment
-        run: |
-          terraform -chdir=terraform apply -input=false -auto-approve tfplan
-          if ($LASTEXITCODE -ne 0) {
-            throw "terraform apply a échoué."
           }
 
       - name: Deployment summary
@@ -843,12 +763,11 @@ jobs:
           Write-Host "Commit : $env:IMAGE_SHA"
           Write-Host "Image : $env:IMAGE_NAME`:$env:DEPLOY_IMAGE_TAG"
           Write-Host "VM : $env:VM_HOST"
-          Write-Host "Terraform : applique avec succès"
+          Write-Host "Déploiement : Docker Compose"
           Write-Host "=============================================="
 
       - name: Remove temporary deployment files
         if: always()
         run: |
-          Remove-Item image.tar, transfer_production.py, terraform-plan.json `
+          Remove-Item image.tar, transfer_production.py `
             -Force -ErrorAction SilentlyContinue
-          Remove-Item terraform/tfplan -Force -ErrorAction SilentlyContinue
