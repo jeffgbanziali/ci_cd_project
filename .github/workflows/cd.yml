@@ -18,8 +18,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-publish:
-    name: "6 - Build & Publish Docker Image"
+
+  # =====================================================
+  # JOB 1 - VALIDATION
+  # =====================================================
+  validate:
+    name: "1 - Validate Environment"
 
     if: >-
       ${{
@@ -30,8 +34,74 @@ jobs:
         )
       }}
 
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Vérifier Python
+        shell: pwsh
+        run: |
+          py -3.11 --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Python 3.11 est obligatoire"
+          }
+
+      - name: Vérifier Docker
+        shell: pwsh
+        run: |
+          docker --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Docker indisponible"
+          }
+
+          docker compose version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Docker Compose indisponible"
+          }
+
+      - name: Vérifier les fichiers
+        shell: pwsh
+        run: |
+          if (!(Test-Path "Dockerfile")) {
+            throw "Dockerfile introuvable à la racine"
+          }
+
+          if (!(Test-Path "docker-compose.prod.yml")) {
+            throw "docker-compose.prod.yml introuvable"
+          }
+
+      - name: Vérifier les secrets
+        shell: pwsh
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+          POSTGRES_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
+        run: |
+          if (!$env:VM_HOST) { throw "VM_HOST manquant" }
+          if (!$env:VM_USER) { throw "VM_USER manquant" }
+          if (!$env:VM_PASSWORD) { throw "VM_PASSWORD manquant" }
+          if (!$env:POSTGRES_PASSWORD) {
+            throw "PROD_POSTGRES_PASSWORD manquant"
+          }
+
+          Write-Host "Tous les contrôles sont validés."
+
+  # =====================================================
+  # JOB 2 - BUILD AND PUBLISH
+  # =====================================================
+  build-publish:
+    name: "2 - Build & Publish Docker Image"
+
+    needs: validate
+
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 40
 
     outputs:
       image: ${{ steps.meta.outputs.image }}
@@ -45,16 +115,16 @@ jobs:
 
       - name: Définir les métadonnées
         id: meta
-        shell: bash
+        shell: pwsh
         run: |
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
-          TAG="${{ github.event.workflow_run.head_sha || github.sha }}"
+          $image = "ghcr.io/${{ github.repository }}".ToLowerInvariant()
+          $tag = "${{ github.event.workflow_run.head_sha || github.sha }}"
 
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          "image=$image" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
 
-          echo "Image : $IMAGE"
-          echo "Tag : $TAG"
+          Write-Host "Image : $image"
+          Write-Host "Tag : $tag"
 
       - name: Configurer Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -66,7 +136,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Construire et publier l'image
+      - name: Construire et publier
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -77,17 +147,102 @@ jobs:
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
 
       - name: Résumé de publication
+        shell: pwsh
         run: |
-          echo "## Docker Image Published" >> "$GITHUB_STEP_SUMMARY"
-          echo "Image: ${{ steps.meta.outputs.image }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Tag: ${{ steps.meta.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          "## Docker Image Published" >> $env:GITHUB_STEP_SUMMARY
+          "Image: ${{ steps.meta.outputs.image }}" >> $env:GITHUB_STEP_SUMMARY
+          "Tag: ${{ steps.meta.outputs.tag }}" >> $env:GITHUB_STEP_SUMMARY
 
-  deploy:
-    name: "7 - Deploy to Production VPS"
+  # =====================================================
+  # JOB 3 - PREPARE VPS
+  # =====================================================
+  prepare-vps:
+    name: "3 - Prepare Production VPS"
 
     needs: build-publish
 
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 15
+
+    environment: production
+
+    steps:
+      - name: Installer Paramiko
+        shell: pwsh
+        run: |
+          py -3.11 -m pip install paramiko
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installation de Paramiko impossible"
+          }
+
+      - name: Vérifier la connexion SSH et Docker
+        shell: pwsh
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+        run: |
+          @'
+          import os
+          import sys
+          import paramiko
+
+          client = paramiko.SSHClient()
+          client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+          try:
+              client.connect(
+                  hostname=os.environ["VM_HOST"],
+                  username=os.environ["VM_USER"],
+                  password=os.environ["VM_PASSWORD"],
+                  look_for_keys=False,
+                  allow_agent=False,
+                  timeout=20,
+                  auth_timeout=20
+              )
+
+              command = "whoami && docker --version && docker compose version"
+              stdin, stdout, stderr = client.exec_command(command)
+
+              output = stdout.read().decode()
+              error = stderr.read().decode()
+              status = stdout.channel.recv_exit_status()
+
+              print(output)
+              if error:
+                  print(error, file=sys.stderr)
+
+              if status != 0:
+                  raise RuntimeError("Vérification du VPS échouée")
+
+              print("SSH_CONNECTION_OK")
+
+          finally:
+              client.close()
+          '@ | py -3.11 -
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Connexion ou vérification VPS échouée"
+          }
+
+      - name: Résumé de préparation
+        shell: pwsh
+        run: |
+          "## VPS Ready" >> $env:GITHUB_STEP_SUMMARY
+          "SSH authentication successful." >> $env:GITHUB_STEP_SUMMARY
+          "Docker and Docker Compose available." >> $env:GITHUB_STEP_SUMMARY
+
+  # =====================================================
+  # JOB 4 - DEPLOY AND VERIFY
+  # =====================================================
+  deploy:
+    name: "4 - Deploy & Verify Production"
+
+    needs:
+      - build-publish
+      - prepare-vps
+
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 30
 
     environment: production
@@ -98,162 +253,168 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      - name: Vérifier les secrets
+      - name: Installer Paramiko
+        shell: pwsh
+        run: |
+          py -3.11 -m pip install paramiko
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installation de Paramiko impossible"
+          }
+
+      - name: Déployer sur le VPS
+        shell: pwsh
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
           VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
           POSTGRES_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
-        run: |
-          set -euo pipefail
-
-          test -n "$VM_HOST" || { echo "VM_HOST manquant"; exit 1; }
-          test -n "$VM_USER" || { echo "VM_USER manquant"; exit 1; }
-          test -n "$VM_PASSWORD" || { echo "VM_PASSWORD manquant"; exit 1; }
-          test -n "$POSTGRES_PASSWORD" || { echo "PROD_POSTGRES_PASSWORD manquant"; exit 1; }
-
-      - name: Installer sshpass
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y sshpass
-
-      - name: Préparer les hôtes SSH
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-        run: |
-          set -euo pipefail
-
-          mkdir -p ~/.ssh
-          ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-
-      - name: Vérifier la connexion SSH
-        env:
-          SSHPASS: ${{ secrets.VM_PASSWORD }}
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-        run: |
-          set -euo pipefail
-
-          sshpass -e ssh \
-            -o PreferredAuthentications=password \
-            -o PubkeyAuthentication=no \
-            -o StrictHostKeyChecking=yes \
-            "$VM_USER@$VM_HOST" \
-            "whoami && docker --version && docker compose version"
-
-      - name: Préparer le dossier de production
-        env:
-          SSHPASS: ${{ secrets.VM_PASSWORD }}
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-        run: |
-          set -euo pipefail
-
-          sshpass -e ssh \
-            -o PreferredAuthentications=password \
-            -o PubkeyAuthentication=no \
-            -o StrictHostKeyChecking=yes \
-            "$VM_USER@$VM_HOST" \
-            "mkdir -p /home/ubuntu/financial-pipeline/runtime"
-
-      - name: Copier Docker Compose
-        env:
-          SSHPASS: ${{ secrets.VM_PASSWORD }}
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-        run: |
-          set -euo pipefail
-
-          sshpass -e scp \
-            -o PreferredAuthentications=password \
-            -o PubkeyAuthentication=no \
-            -o StrictHostKeyChecking=yes \
-            docker-compose.prod.yml \
-            "$VM_USER@$VM_HOST:/home/ubuntu/financial-pipeline/runtime/docker-compose.prod.yml"
-
-      - name: Déployer les services
-        env:
-          SSHPASS: ${{ secrets.VM_PASSWORD }}
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-          POSTGRES_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_ACTOR: ${{ github.actor }}
           IMAGE: ${{ needs.build-publish.outputs.image }}
           TAG: ${{ needs.build-publish.outputs.tag }}
-
-        shell: bash
-
         run: |
+          @'
+          import os
+          import sys
+          import paramiko
+
+          def dotenv_quote(value):
+              if "\n" in value or "\r" in value:
+                  raise ValueError("Valeur .env invalide")
+              return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+          host = os.environ["VM_HOST"]
+          user = os.environ["VM_USER"]
+          password = os.environ["VM_PASSWORD"]
+          postgres_password = os.environ["POSTGRES_PASSWORD"]
+          ghcr_token = os.environ["GHCR_TOKEN"]
+          actor = os.environ["GITHUB_ACTOR"]
+          image = os.environ["IMAGE"]
+          tag = os.environ["TAG"]
+
+          deploy_dir = "/home/ubuntu/financial-pipeline/runtime"
+
+          client = paramiko.SSHClient()
+          client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+          def remote(command, input_text=None):
+              stdin, stdout, stderr = client.exec_command(command)
+
+              if input_text is not None:
+                  stdin.write(input_text)
+                  stdin.flush()
+
+              stdin.channel.shutdown_write()
+
+              output = stdout.read().decode()
+              error = stderr.read().decode()
+              status = stdout.channel.recv_exit_status()
+
+              if output:
+                  print(output)
+
+              if error:
+                  print(error, file=sys.stderr)
+
+              if status != 0:
+                  raise RuntimeError(
+                      f"Commande distante échouée (code {status})"
+                  )
+
+          try:
+              print("Connexion au VPS...")
+
+              client.connect(
+                  hostname=host,
+                  username=user,
+                  password=password,
+                  look_for_keys=False,
+                  allow_agent=False,
+                  timeout=20,
+                  auth_timeout=20
+              )
+
+              print("Préparation du dossier...")
+              remote(f"mkdir -p {deploy_dir}")
+
+              sftp = client.open_sftp()
+
+              print("Transfert de Docker Compose...")
+              sftp.put(
+                  "docker-compose.prod.yml",
+                  f"{deploy_dir}/docker-compose.prod.yml"
+              )
+
+              env_content = "\n".join([
+                  f"POSTGRES_PASSWORD={dotenv_quote(postgres_password)}",
+                  f"PIPELINE_IMAGE={dotenv_quote(image + ':' + tag)}",
+                  "SCHEDULE_SECONDS=300",
+                  "S3_ACCESS_KEY=minioadmin",
+                  "S3_SECRET_KEY=minioadminpassword",
+                  "S3_BUCKET=transactions-bucket",
+                  ""
+              ])
+
+              with sftp.file(f"{deploy_dir}/.env", "w") as env_file:
+                  env_file.write(env_content)
+
+              sftp.chmod(f"{deploy_dir}/.env", 0o600)
+              sftp.close()
+
+              print("Connexion à GHCR...")
+              import shlex
+
+              login_command = (
+                  "docker login ghcr.io -u "
+                  + shlex.quote(actor)
+                  + " --password-stdin"
+              )
+              remote(login_command, ghcr_token + "\n")
+
+              script = f"""#!/usr/bin/env bash
           set -euo pipefail
 
-          POSTGRES_PASSWORD_B64=$(printf '%s' "$POSTGRES_PASSWORD" | base64 -w0)
-          GHCR_TOKEN_B64=$(printf '%s' "$GHCR_TOKEN" | base64 -w0)
+          cd {shlex.quote(deploy_dir)}
 
-          sshpass -e ssh \
-            -o PreferredAuthentications=password \
-            -o PubkeyAuthentication=no \
-            -o StrictHostKeyChecking=yes \
-            "$VM_USER@$VM_HOST" \
-            "POSTGRES_PASSWORD_B64=$POSTGRES_PASSWORD_B64 GHCR_TOKEN_B64=$GHCR_TOKEN_B64 IMAGE=$IMAGE TAG=$TAG GITHUB_ACTOR=$GITHUB_ACTOR bash -s" <<'REMOTE'
+          echo "Validation Docker Compose..."
+          docker compose -p financial-pipeline -f docker-compose.prod.yml config -q
 
-          set -euo pipefail
-          umask 077
+          echo "Téléchargement des images..."
+          docker compose -p financial-pipeline -f docker-compose.prod.yml pull scheduler postgres s3
 
-          DEPLOY_DIR="/home/ubuntu/financial-pipeline/runtime"
+          echo "Démarrage des services..."
+          docker compose -p financial-pipeline -f docker-compose.prod.yml up -d
 
-          cd "$DEPLOY_DIR"
+          echo "Déconnexion GHCR..."
+          docker logout ghcr.io || true
 
-          POSTGRES_PASSWORD=$(printf '%s' "$POSTGRES_PASSWORD_B64" | base64 -d)
-          GHCR_TOKEN=$(printf '%s' "$GHCR_TOKEN_B64" | base64 -d)
+          echo "État des services..."
+          docker compose -p financial-pipeline -f docker-compose.prod.yml ps
 
-          # Création du fichier d'environnement protégé
-          printf '%s\n' \
-            "POSTGRES_PASSWORD=$POSTGRES_PASSWORD" \
-            "PIPELINE_IMAGE=$IMAGE:$TAG" \
-            "SCHEDULE_SECONDS=300" \
-            "S3_ACCESS_KEY=minioadmin" \
-            "S3_SECRET_KEY=minioadminpassword" \
-            "S3_BUCKET=transactions-bucket" \
-            > .env
+          echo "Derniers logs du scheduler..."
+          docker compose -p financial-pipeline -f docker-compose.prod.yml logs --tail=40 scheduler
 
-          chmod 600 .env
+          echo "DEPLOYMENT_SUCCESS"
+          """
 
-          # Authentification au registre Docker
-          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io \
-            -u "$GITHUB_ACTOR" \
-            --password-stdin
+              print("Déploiement en cours...")
+              remote("bash -s", script)
 
-          unset GHCR_TOKEN
+              print("Déploiement terminé avec succès.")
 
-          # Validation de la configuration
-          docker compose -p financial-pipeline \
-            -f docker-compose.prod.yml config -q
+          finally:
+              client.close()
+          '@ | py -3.11 -
 
-          # Téléchargement des images
-          docker compose -p financial-pipeline \
-            -f docker-compose.prod.yml pull scheduler postgres s3
+          if ($LASTEXITCODE -ne 0) {
+            throw "Le déploiement a échoué"
+          }
 
-          # Démarrage / mise à jour des services
-          docker compose -p financial-pipeline \
-            -f docker-compose.prod.yml up -d
-
-          # Déconnexion du registre
-          docker logout ghcr.io
-
-          # Vérification
-          docker compose -p financial-pipeline \
-            -f docker-compose.prod.yml ps
-
-          echo "Déploiement terminé."
-
-          REMOTE
-
-      - name: Résumé du déploiement
+      - name: Résumé final
         if: success()
+        shell: pwsh
         run: |
-          echo "## Production Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
-          echo "Image: ${{ needs.build-publish.outputs.image }}:${{ needs.build-publish.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Scheduler: 300 seconds" >> "$GITHUB_STEP_SUMMARY"
-          echo "Deployment directory: /home/ubuntu/financial-pipeline/runtime" >> "$GITHUB_STEP_SUMMARY"
+          "## Production Deployment Successful" >> $env:GITHUB_STEP_SUMMARY
+          "Image: ${{ needs.build-publish.outputs.image }}:${{ needs.build-publish.outputs.tag }}" >> $env:GITHUB_STEP_SUMMARY
+          "Deployment: /home/ubuntu/financial-pipeline/runtime" >> $env:GITHUB_STEP_SUMMARY
+          "Scheduler interval: 300 seconds" >> $env:GITHUB_STEP_SUMMARY
