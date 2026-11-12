@@ -1,135 +1,205 @@
-name: CI
+
+name: Financial Data Pipeline CI
 
 on:
   push:
+    branches: [main, develop]
   pull_request:
+    branches: [main, develop]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
+    name: Tests - Python 3.11 / Windows
     runs-on: [self-hosted, Windows]
-
-    # FIX 1 : le bloc "services:" est supprimé (non supporté sur un runner Windows).
-    # PostgreSQL est maintenant lancé par l'étape "Démarrer PostgreSQL (Docker)".
+    timeout-minutes: 30
 
     env:
-      # FIX 2 : port 55432 + 127.0.0.1 (5432 est déjà pris sur votre machine, et "localhost" peut viser l'IPv6)
+      PYTHON_VERSION: "3.11"
       PG_URL: postgresql://pipeline:pipeline@127.0.0.1:55432/pipeline_test
+      TEST_DB_URL: postgresql://pipeline:pipeline@127.0.0.1:55432/pipeline_test
+      DB_URL: postgresql://pipeline:pipeline@127.0.0.1:55432/pipeline_test
+      S3_ENDPOINT: http://127.0.0.1:59000
+      TEST_S3_ENDPOINT: http://127.0.0.1:59000
+      S3_BUCKET: ci-warmup
+      RETRY_MAX_ATTEMPTS: "10"
+      RETRY_WAIT_SECONDS: "1"
+
+    defaults:
+      run:
+        shell: powershell
 
     steps:
+
+      # 1. Recuperation du code
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: requirements-dev.txt
-
-      - name: Installer les dépendances
-        run: pip install -r requirements-dev.txt
-
-      - name: Qualité du code (ruff)
-        run: ruff check .
-
-      # FIX 1 (suite) : remplace le service Postgres de GitHub Actions
-      - name: Démarrer PostgreSQL (Docker)
+      # 2. Verification de Python
+      - name: Vérifier Python
         run: |
-          $old = docker ps -aq --filter "name=^ci-postgres$"
-          if ($old) { docker rm -f ci-postgres }
-          docker run -d --name ci-postgres -e POSTGRES_DB=pipeline_test -e POSTGRES_USER=pipeline -e POSTGRES_PASSWORD=pipeline -p 127.0.0.1:55432:5432 postgres:15-alpine
+          py -3.11 --version
+          py -3.11 -m pip --version
+
+      # 3. Installation des dependances
+      - name: Installer les dépendances
+        run: |
+          py -3.11 -m pip install --upgrade pip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          py -3.11 -m pip install -r requirements-dev.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # 4. Qualite du code
+      - name: Analyse statique Ruff
+        run: |
+          py -3.11 -m ruff check .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # 5. Demarrage PostgreSQL
+      - name: Démarrer PostgreSQL
+        run: |
+          $existing = docker ps -aq --filter "name=^ci-postgres$"
+          if ($existing) { docker rm -f ci-postgres }
+
+          docker run -d `
+            --name ci-postgres `
+            -e POSTGRES_DB=pipeline_test `
+            -e POSTGRES_USER=pipeline `
+            -e POSTGRES_PASSWORD=pipeline `
+            -p 127.0.0.1:55432:5432 `
+            postgres:15-alpine
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           $ready = $false
+
           for ($i = 0; $i -lt 30; $i++) {
-            docker exec ci-postgres pg_isready -h 127.0.0.1 -U pipeline -d pipeline_test
-            if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+            docker exec ci-postgres pg_isready -U pipeline -d pipeline_test
+
+            if ($LASTEXITCODE -eq 0) {
+              $ready = $true
+              break
+            }
+
             Start-Sleep -Seconds 2
           }
+
           if (-not $ready) {
-            Write-Host "::error::PostgreSQL n'est pas prêt après 60 s"
-            docker logs --tail 30 ci-postgres
-            exit 1
+            docker logs --tail 50 ci-postgres
+            throw "PostgreSQL n'est pas disponible."
           }
-          Write-Host "PostgreSQL disponible"
 
-      # FIX 3 : "timeout 90 sh -c ... curl" n'existe pas sous Windows (le timeout de Windows est une commande différente).
-      # Port 59000 dédié (9000 est sans doute pris par votre stack de développement).
-      # L'attente utilise le code du projet (S3Manager) et fait une vraie écriture de test.
-      - name: Démarrer le service S3 (SeaweedFS)
-        env:
-          S3_ENDPOINT: http://127.0.0.1:59000
-          S3_BUCKET: ci-warmup
-          RETRY_MAX_ATTEMPTS: "10"
-          RETRY_WAIT_SECONDS: "1"
+          Write-Host "PostgreSQL prêt."
+
+      # 6. Demarrage SeaweedFS
+      - name: Démarrer SeaweedFS S3
         run: |
-          $old = docker ps -aq --filter "name=^ci-s3$"
-          if ($old) { docker rm -f ci-s3 }
-          docker run -d --name ci-s3 -p 127.0.0.1:59000:8333 chrislusf/seaweedfs:latest server -s3 -dir=/data
+          $existing = docker ps -aq --filter "name=^ci-s3$"
+          if ($existing) { docker rm -f ci-s3 }
+
+          docker run -d `
+            --name ci-s3 `
+            -p 127.0.0.1:59000:8333 `
+            chrislusf/seaweedfs:latest `
+            server -s3 -dir=/data
+
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -c "from src.storage.s3_client import S3Manager; s = S3Manager(); s.wait_until_ready(); s.ensure_bucket_exists(); open('warmup.csv', 'w').write('x'); s.upload_file('warmup.csv', 'warmup.csv')"
+
+          Write-Host "Attente de la disponibilité S3..."
+
+          py -3.11 -c "from src.storage.s3_client import S3Manager; s = S3Manager(); s.wait_until_ready(); s.ensure_bucket_exists()"
+
           if ($LASTEXITCODE -ne 0) {
-            docker logs --tail 40 ci-s3
-            exit 1
+            docker logs --tail 50 ci-s3
+            throw "SeaweedFS n'est pas disponible."
           }
-          Write-Host "S3 disponible"
 
-      - name: Tests unitaires + intégration (vraie base Postgres + vrai S3)
-        env:
-          TEST_DB_URL: ${{ env.PG_URL }}
-          TEST_S3_ENDPOINT: http://127.0.0.1:59000
-        run: pytest -v --cov=src --cov-report=term-missing --cov-fail-under=80
+          Write-Host "SeaweedFS prêt."
 
-      # FIX 4 : "set -o pipefail" et "grep" n'existent pas en PowerShell ; avec 2>&1, PowerShell 5.1
-      # traite chaque log Python (écrit sur stderr) comme une erreur. Même logique, version PowerShell.
-      # (motifs sans accents : la console Windows réencode les "é")
-      - name: Pipeline complète avec PANNES SIMULÉES (retry DB + S3)
+      # 7. Tests unitaires et integration
+      - name: Exécuter les tests
+        run: |
+          py -3.11 -m pytest tests -v `
+            --cov=src `
+            --cov-report=term-missing `
+            --cov-fail-under=80
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Les tests ont échoué."
+          }
+
+      # 8. Simulation des pannes et validation des retries
+      - name: Tester la pipeline avec pannes simulées
         env:
-          DB_URL: ${{ env.PG_URL }}
-          S3_ENDPOINT: http://127.0.0.1:59000
           SIMULATE_DB_FAILURES: "2"
           SIMULATE_S3_FAILURES: "2"
           RETRY_WAIT_SECONDS: "0.5"
         run: |
-          $ErrorActionPreference = "Continue"
-          python -c "from src.db.connection import reset_db; reset_db()"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m src.pipeline.main 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath run1.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $ok = $true
-          foreach ($p in @("3 trait.+\(s\), 0 ignor.+\(s\)", "panne temporaire 'db'", "panne temporaire 's3'")) {
-            if (-not (Select-String -Path run1.log -Pattern $p -Quiet)) {
-              Write-Host "::error::Texte attendu absent des logs : $p"
-              $ok = $false
+          py -3.11 -c "from src.db.connection import reset_db; reset_db()"
+
+          if ($LASTEXITCODE -ne 0) { throw "Réinitialisation DB échouée." }
+
+          py -3.11 -m src.pipeline.main *> run1.log
+          $exitCode = $LASTEXITCODE
+
+          Get-Content run1.log
+
+          if ($exitCode -ne 0) {
+            throw "La pipeline avec pannes simulées a échoué."
+          }
+
+          $patterns = @(
+            "3 trait.+\(s\), 0 ignor.+\(s\)",
+            "panne temporaire 'db'",
+            "panne temporaire 's3'"
+          )
+
+          foreach ($pattern in $patterns) {
+            if (-not (Select-String -Path run1.log -Pattern $pattern -Quiet)) {
+              throw "Résultat attendu absent des logs : $pattern"
             }
           }
-          if (-not $ok) { exit 1 }
 
-      - name: Idempotence (relance = aucun fichier retraité)
-        env:
-          DB_URL: ${{ env.PG_URL }}
-          S3_ENDPOINT: http://127.0.0.1:59000
+          Write-Host "Retry DB et S3 validés."
+
+      # 9. Verification de l'idempotence
+      - name: Tester l'idempotence
         run: |
-          $ErrorActionPreference = "Continue"
-          python -m src.pipeline.main 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath run2.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not (Select-String -Path run2.log -Pattern "0 trait.+\(s\), 3 ignor.+\(s\)" -Quiet)) {
-            Write-Host "::error::Des fichiers ont ete retraites (attendu : 0 traites, 3 ignores)"
-            exit 1
+          py -3.11 -m src.pipeline.main *> run2.log
+          $exitCode = $LASTEXITCODE
+
+          Get-Content run2.log
+
+          if ($exitCode -ne 0) {
+            throw "La seconde exécution a échoué."
           }
 
-      # FIX 5 : "| tail -50" n'existe pas sous PowerShell
-      - name: Logs des services en cas d'échec
+          if (-not (Select-String -Path run2.log -Pattern "0 trait.+\(s\), 3 ignor.+\(s\)" -Quiet)) {
+            throw "Idempotence non respectée : les fichiers ont été retraités."
+          }
+
+          Write-Host "Idempotence validée."
+
+      # 10. Logs en cas d'echec
+      - name: Récupérer les logs Docker
         if: failure()
         run: |
-          docker logs --tail 50 ci-s3
-          docker logs --tail 50 ci-postgres
+          docker logs --tail 50 ci-postgres 2>&1
+          docker logs --tail 50 ci-s3 2>&1
 
-      # FIX 6 : sans "services:", GitHub ne supprime plus le conteneur Postgres tout seul
-      - name: Arrêter les conteneurs
+      # 11. Nettoyage systematique
+      - name: Nettoyer les conteneurs
         if: always()
         run: |
-          foreach ($c in "ci-s3", "ci-postgres") {
-            if (docker ps -aq --filter "name=^$c$") { docker rm -f $c }
+          foreach ($container in @("ci-s3", "ci-postgres")) {
+            $id = docker ps -aq --filter "name=^$container$"
+            if ($id) {
+              docker rm -f $container
+            }
           }
-          exit 0
+
+          Write-Host "Nettoyage terminé."
