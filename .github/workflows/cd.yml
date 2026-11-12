@@ -20,7 +20,7 @@ concurrency:
 jobs:
 
   # =====================================================
-  # JOB 1 - VALIDATION
+  # JOB 1 - VALIDATE ENVIRONMENT
   # =====================================================
   validate:
     name: "1 - Validate Environment"
@@ -43,17 +43,22 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      - name: Vérifier Python
-        shell: pwsh
+      - name: Vérifier Python 3.11
+        shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+
           py -3.11 --version
+
           if ($LASTEXITCODE -ne 0) {
             throw "Python 3.11 est obligatoire"
           }
 
       - name: Vérifier Docker
-        shell: pwsh
+        shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+
           docker --version
           if ($LASTEXITCODE -ne 0) {
             throw "Docker indisponible"
@@ -64,11 +69,17 @@ jobs:
             throw "Docker Compose indisponible"
           }
 
+          $engine = docker info --format '{{.OSType}}'
+
+          if ($LASTEXITCODE -ne 0 -or $engine -ne "linux") {
+            throw "Docker doit utiliser les conteneurs Linux"
+          }
+
       - name: Vérifier les fichiers
-        shell: pwsh
+        shell: powershell
         run: |
           if (!(Test-Path "Dockerfile")) {
-            throw "Dockerfile introuvable à la racine"
+            throw "Dockerfile introuvable"
           }
 
           if (!(Test-Path "docker-compose.prod.yml")) {
@@ -76,7 +87,7 @@ jobs:
           }
 
       - name: Vérifier les secrets
-        shell: pwsh
+        shell: powershell
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
@@ -115,39 +126,71 @@ jobs:
 
       - name: Définir les métadonnées
         id: meta
-        shell: pwsh
+        shell: powershell
         run: |
-          $image = "ghcr.io/${{ github.repository }}".ToLowerInvariant()
+          $image = ("ghcr.io/${{ github.repository }}").ToLowerInvariant()
           $tag = "${{ github.event.workflow_run.head_sha || github.sha }}"
 
-          "image=$image" >> $env:GITHUB_OUTPUT
-          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "image=$image"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag"
 
           Write-Host "Image : $image"
           Write-Host "Tag : $tag"
 
-      - name: Configurer Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Connexion à GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        shell: powershell
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          $ErrorActionPreference = "Stop"
 
-      - name: Construire et publier
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ steps.meta.outputs.image }}:latest
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          $env:GHCR_TOKEN | docker login ghcr.io `
+            --username $env:GITHUB_ACTOR `
+            --password-stdin
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Connexion à GHCR échouée"
+          }
+
+      - name: Construire l'image Docker
+        shell: powershell
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          docker build --platform linux/amd64 `
+            -t "$env:IMAGE`:$env:TAG" `
+            -t "$env:IMAGE`:latest" .
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Construction Docker échouée"
+          }
+
+      - name: Publier sur GHCR
+        shell: powershell
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          docker push "$env:IMAGE`:$env:TAG"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Publication de l'image versionnée échouée"
+          }
+
+          docker push "$env:IMAGE`:latest"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Publication de latest échouée"
+          }
 
       - name: Résumé de publication
-        shell: pwsh
+        shell: powershell
         run: |
           "## Docker Image Published" >> $env:GITHUB_STEP_SUMMARY
           "Image: ${{ steps.meta.outputs.image }}" >> $env:GITHUB_STEP_SUMMARY
@@ -168,15 +211,16 @@ jobs:
 
     steps:
       - name: Installer Paramiko
-        shell: pwsh
+        shell: powershell
         run: |
           py -3.11 -m pip install paramiko
+
           if ($LASTEXITCODE -ne 0) {
-            throw "Installation de Paramiko impossible"
+            throw "Installation de Paramiko échouée"
           }
 
-      - name: Vérifier la connexion SSH et Docker
-        shell: pwsh
+      - name: Tester la connexion SSH
+        shell: powershell
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
@@ -209,6 +253,7 @@ jobs:
               status = stdout.channel.recv_exit_status()
 
               print(output)
+
               if error:
                   print(error, file=sys.stderr)
 
@@ -222,11 +267,11 @@ jobs:
           '@ | py -3.11 -
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Connexion ou vérification VPS échouée"
+            throw "Connexion SSH échouée"
           }
 
-      - name: Résumé de préparation
-        shell: pwsh
+      - name: Résumé VPS
+        shell: powershell
         run: |
           "## VPS Ready" >> $env:GITHUB_STEP_SUMMARY
           "SSH authentication successful." >> $env:GITHUB_STEP_SUMMARY
@@ -254,15 +299,16 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Installer Paramiko
-        shell: pwsh
+        shell: powershell
         run: |
           py -3.11 -m pip install paramiko
+
           if ($LASTEXITCODE -ne 0) {
-            throw "Installation de Paramiko impossible"
+            throw "Installation de Paramiko échouée"
           }
 
-      - name: Déployer sur le VPS
-        shell: pwsh
+      - name: Déployer et vérifier
+        shell: powershell
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
@@ -276,6 +322,7 @@ jobs:
           @'
           import os
           import sys
+          import shlex
           import paramiko
 
           def dotenv_quote(value):
@@ -303,8 +350,7 @@ jobs:
               if input_text is not None:
                   stdin.write(input_text)
                   stdin.flush()
-
-              stdin.channel.shutdown_write()
+                  stdin.channel.shutdown_write()
 
               output = stdout.read().decode()
               error = stderr.read().decode()
@@ -318,7 +364,7 @@ jobs:
 
               if status != 0:
                   raise RuntimeError(
-                      f"Commande distante échouée (code {status})"
+                      f"Commande distante échouée : code {status}"
                   )
 
           try:
@@ -335,19 +381,19 @@ jobs:
               )
 
               print("Préparation du dossier...")
-              remote(f"mkdir -p {deploy_dir}")
+              remote("mkdir -p " + shlex.quote(deploy_dir))
 
               sftp = client.open_sftp()
 
               print("Transfert de Docker Compose...")
               sftp.put(
                   "docker-compose.prod.yml",
-                  f"{deploy_dir}/docker-compose.prod.yml"
+                  deploy_dir + "/docker-compose.prod.yml"
               )
 
               env_content = "\n".join([
-                  f"POSTGRES_PASSWORD={dotenv_quote(postgres_password)}",
-                  f"PIPELINE_IMAGE={dotenv_quote(image + ':' + tag)}",
+                  "POSTGRES_PASSWORD=" + dotenv_quote(postgres_password),
+                  "PIPELINE_IMAGE=" + dotenv_quote(image + ":" + tag),
                   "SCHEDULE_SECONDS=300",
                   "S3_ACCESS_KEY=minioadmin",
                   "S3_SECRET_KEY=minioadminpassword",
@@ -355,23 +401,23 @@ jobs:
                   ""
               ])
 
-              with sftp.file(f"{deploy_dir}/.env", "w") as env_file:
+              with sftp.file(deploy_dir + "/.env", "w") as env_file:
                   env_file.write(env_content)
 
-              sftp.chmod(f"{deploy_dir}/.env", 0o600)
+              sftp.chmod(deploy_dir + "/.env", 0o600)
               sftp.close()
 
               print("Connexion à GHCR...")
-              import shlex
 
               login_command = (
                   "docker login ghcr.io -u "
                   + shlex.quote(actor)
                   + " --password-stdin"
               )
+
               remote(login_command, ghcr_token + "\n")
 
-              script = f"""#!/usr/bin/env bash
+              script = f"""
           set -euo pipefail
 
           cd {shlex.quote(deploy_dir)}
@@ -412,7 +458,7 @@ jobs:
 
       - name: Résumé final
         if: success()
-        shell: pwsh
+        shell: powershell
         run: |
           "## Production Deployment Successful" >> $env:GITHUB_STEP_SUMMARY
           "Image: ${{ needs.build-publish.outputs.image }}:${{ needs.build-publish.outputs.tag }}" >> $env:GITHUB_STEP_SUMMARY
