@@ -15,13 +15,20 @@ permissions:
 
 jobs:
 
-  # ==========================================
-  # JOB 3 : BUILD & PUBLISH
-  # ==========================================
+  # =====================================================
+  # JOB 6 - BUILD AND PUBLISH
+  # =====================================================
   build-publish:
-    name: "3 - Build & Publish Docker Image"
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    name: "6 - Build & Publish Docker Image"
+
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        github.event.workflow_run.conclusion == 'success'
+      }}
+
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     outputs:
       image: ${{ steps.meta.outputs.image }}
@@ -35,12 +42,16 @@ jobs:
 
       - name: Définir les métadonnées
         id: meta
+        shell: bash
         run: |
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
           TAG="${{ github.event.workflow_run.head_sha || github.sha }}"
 
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Image : $IMAGE"
+          echo "Tag : $TAG"
 
       - name: Configurer Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -56,19 +67,29 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
           platforms: linux/amd64
+          push: true
           tags: |
             ${{ steps.meta.outputs.image }}:latest
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
 
-  # ==========================================
-  # JOB 4 : DEPLOIEMENT VPS
-  # ==========================================
+      - name: Résumé de publication
+        run: |
+          echo "## Docker Image Published" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image: ${{ steps.meta.outputs.image }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tag: ${{ steps.meta.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+
+  # =====================================================
+  # JOB 7 - DEPLOY TO PRODUCTION
+  # =====================================================
   deploy:
-    name: "4 - Deploy to VPS"
+    name: "7 - Deploy to Production VPS"
+
     needs: build-publish
+
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     environment: production
 
     steps:
@@ -84,10 +105,10 @@ jobs:
           VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
           POSTGRES_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
         run: |
-          test -n "$VM_HOST" || (echo "VM_HOST manquant" && exit 1)
-          test -n "$VM_USER" || (echo "VM_USER manquant" && exit 1)
-          test -n "$VM_SSH_KEY" || (echo "VM_SSH_KEY manquant" && exit 1)
-          test -n "$POSTGRES_PASSWORD" || (echo "PROD_POSTGRES_PASSWORD manquant" && exit 1)
+          test -n "$VM_HOST" || { echo "VM_HOST manquant"; exit 1; }
+          test -n "$VM_USER" || { echo "VM_USER manquant"; exit 1; }
+          test -n "$VM_SSH_KEY" || { echo "VM_SSH_KEY manquant"; exit 1; }
+          test -n "$POSTGRES_PASSWORD" || { echo "PROD_POSTGRES_PASSWORD manquant"; exit 1; }
 
       - name: Préparer SSH
         env:
@@ -104,7 +125,14 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts
 
-      - name: Préparer le dossier distant
+      - name: Vérifier la connexion SSH
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          ssh -i deploy_key "$VM_USER@$VM_HOST" "echo SSH_CONNECTION_OK"
+
+      - name: Préparer le dossier de production
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
@@ -120,7 +148,7 @@ jobs:
           scp -i deploy_key docker-compose.prod.yml \
             "$VM_USER@$VM_HOST:/home/ubuntu/financial-pipeline/runtime/docker-compose.prod.yml"
 
-      - name: Déployer sur le VPS
+      - name: Déployer les services
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
@@ -136,7 +164,8 @@ jobs:
           POSTGRES_PASSWORD_B64=$(printf '%s' "$POSTGRES_PASSWORD" | base64 -w0)
           GHCR_TOKEN_B64=$(printf '%s' "$GHCR_TOKEN" | base64 -w0)
 
-          ssh -i deploy_key "$VM_USER@$VM_HOST" \
+          ssh -i deploy_key \
+            "$VM_USER@$VM_HOST" \
             "POSTGRES_PASSWORD_B64=$POSTGRES_PASSWORD_B64 GHCR_TOKEN_B64=$GHCR_TOKEN_B64 IMAGE=$IMAGE TAG=$TAG GITHUB_ACTOR=$GITHUB_ACTOR bash -s" <<'REMOTE'
 
           set -euo pipefail
@@ -154,11 +183,17 @@ jobs:
           echo "$GHCR_TOKEN" | docker login ghcr.io \
             -u "$GITHUB_ACTOR" --password-stdin
 
+          echo "Téléchargement des images..."
+
           docker compose -p financial-pipeline \
             -f docker-compose.prod.yml pull
 
+          echo "Démarrage des services..."
+
           docker compose -p financial-pipeline \
             -f docker-compose.prod.yml up -d
+
+          echo "Vérification des services..."
 
           docker compose -p financial-pipeline \
             -f docker-compose.prod.yml ps
@@ -168,3 +203,10 @@ jobs:
       - name: Nettoyer la clé SSH
         if: always()
         run: rm -f deploy_key
+
+      - name: Résumé du déploiement
+        if: success()
+        run: |
+          echo "## Production Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image: ${{ needs.build-publish.outputs.image }}:${{ needs.build-publish.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Scheduler: 300 seconds" >> "$GITHUB_STEP_SUMMARY"
