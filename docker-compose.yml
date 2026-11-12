@@ -1,39 +1,54 @@
-# Environnement local / CI : base PostgreSQL + stockage S3 (SeaweedFS).
-# Lancer seulement l'infrastructure :   docker compose up -d
-# Lancer aussi la pipeline complète :   docker compose --profile pipeline run --rm pipeline
+
 services:
   postgres:
     image: postgres:15-alpine
+    container_name: financial-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-financial_db}
       POSTGRES_USER: ${POSTGRES_USER:-pipeline_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pipeline_password}
     ports:
-      - "5432:5432"
+      - "55432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pipeline_user} -d ${POSTGRES_DB:-financial_db}"]
+      test:
+        - CMD-SHELL
+        - pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}
       interval: 5s
       timeout: 5s
       retries: 10
 
   s3:
     image: chrislusf/seaweedfs:latest
-    command: "server -s3 -dir=/data"
+    container_name: financial-s3
+    restart: unless-stopped
+    command: ["server", "-s3", "-dir=/data"]
     ports:
-      - "9000:8333"   # API S3 de SeaweedFS (8333) exposée sur le port 9000
+      - "59000:8333"
     volumes:
       - s3data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q --spider http://localhost:8333/ || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   pipeline:
-    build: .
-    profiles: ["pipeline"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles:
+      - pipeline
     depends_on:
       postgres:
         condition: service_healthy
       s3:
-        condition: service_started
+        condition: service_healthy
     environment:
       DB_URL: postgresql://${POSTGRES_USER:-pipeline_user}:${POSTGRES_PASSWORD:-pipeline_password}@postgres:5432/${POSTGRES_DB:-financial_db}
       S3_ENDPOINT: http://s3:8333
@@ -42,6 +57,7 @@ services:
       S3_BUCKET: ${S3_BUCKET:-transactions-bucket}
       SIMULATE_DB_FAILURES: ${SIMULATE_DB_FAILURES:-0}
       SIMULATE_S3_FAILURES: ${SIMULATE_S3_FAILURES:-0}
+    restart: "no"
 
 volumes:
   pgdata:

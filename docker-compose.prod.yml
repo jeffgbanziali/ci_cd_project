@@ -1,5 +1,4 @@
-# Production (VM) : base + S3 + scheduler qui traite régulièrement les nouveaux fichiers.
-# Déployé automatiquement par .github/workflows/cd.yml
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -7,40 +6,60 @@ services:
     environment:
       POSTGRES_DB: financial_db
       POSTGRES_USER: pipeline_user
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?mot de passe requis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD est obligatoire}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pipeline_user -d financial_db"]
+      test:
+        - CMD-SHELL
+        - pg_isready -U pipeline_user -d financial_db
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      - financial-network
 
   s3:
     image: chrislusf/seaweedfs:latest
     restart: unless-stopped
-    command: "server -s3 -dir=/data"
-    ports:
-      - "9000:8333"   # dépôt des CSV dans le bucket (à protéger par le pare-feu de la VM)
+    command: ["server", "-s3", "-dir=/data"]
     volumes:
       - s3data:/data
+    networks:
+      - financial-network
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q --spider http://localhost:8333/ || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   scheduler:
-    image: ${PIPELINE_IMAGE:?image requise}
+    image: ${PIPELINE_IMAGE:?PIPELINE_IMAGE est obligatoire}
     restart: unless-stopped
-    command: ["--schedule", "${SCHEDULE_SECONDS:-300}"]   # un cycle toutes les 5 minutes
+    command: ["--schedule", "${SCHEDULE_SECONDS:-300}"]
     depends_on:
       postgres:
         condition: service_healthy
       s3:
-        condition: service_started
+        condition: service_healthy
     environment:
       DB_URL: postgresql://pipeline_user:${POSTGRES_PASSWORD}@postgres:5432/financial_db
       S3_ENDPOINT: http://s3:8333
-      S3_ACCESS_KEY: minioadmin
-      S3_SECRET_KEY: minioadminpassword
-      S3_BUCKET: transactions-bucket
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadminpassword}
+      S3_BUCKET: ${S3_BUCKET:-transactions-bucket}
+      RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-5}
+      RETRY_WAIT_SECONDS: ${RETRY_WAIT_SECONDS:-2}
+    networks:
+      - financial-network
 
 volumes:
   pgdata:
   s3data:
+
+networks:
+  financial-network:
+    driver: bridge
