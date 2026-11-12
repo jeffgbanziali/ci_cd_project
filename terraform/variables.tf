@@ -1,16 +1,19 @@
+
 variable "ssh_host" {
   type        = string
   description = "Adresse IP de la VM"
 }
 
 variable "ssh_user" {
-  type    = string
-  default = "ubuntu"
+  type        = string
+  default     = "ubuntu"
+  description = "Utilisateur SSH de la VM"
 }
 
-variable "ssh_private_key_path" {
+variable "ssh_password" {
   type        = string
-  description = "Chemin de la clé SSH privée"
+  sensitive   = true
+  description = "Mot de passe SSH de la VM de production"
 }
 
 variable "deploy_revision" {
