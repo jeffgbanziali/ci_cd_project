@@ -20,6 +20,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Check Python
         shell: powershell
         run: |
@@ -44,6 +49,10 @@ jobs:
     needs: dependencies
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Ruff lint
         shell: powershell
         run: |
@@ -55,6 +64,10 @@ jobs:
     needs: quality
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Run unit tests (excluding dedicated SLM tests)
         shell: powershell
         run: |
@@ -66,6 +79,10 @@ jobs:
     needs: unit-tests
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Run SLM extractor tests
         shell: powershell
         run: |
@@ -77,6 +94,10 @@ jobs:
     needs: slm-tests
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Start PostgreSQL
         shell: powershell
         run: |
@@ -133,6 +154,10 @@ jobs:
     needs: integration-tests
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Start PostgreSQL and SeaweedFS
         shell: powershell
         run: |
@@ -175,6 +200,10 @@ jobs:
     needs: resilience-tests
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Start PostgreSQL and SeaweedFS
         shell: powershell
         run: |
