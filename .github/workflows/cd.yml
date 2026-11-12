@@ -1,39 +1,39 @@
+
 name: CD
 
-# Déploiement automatique sur la VM UNIQUEMENT si la CI est verte sur main.
 on:
   workflow_run:
-    workflows: ["CI"]
+    workflows: ["Financial Data Pipeline CI"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   deploy:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    env:
-      REGISTRY: ghcr.io
+
     steps:
-      - name: Checkout (commit validé par la CI)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      - name: Nom de l'image (minuscules obligatoires)
-        run: echo "IMAGE=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - name: Define image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
-      - name: Connexion à GitHub Container Registry
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Construire et publier l'image Docker
+      - name: Build and publish Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -42,26 +42,53 @@ jobs:
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.event.workflow_run.head_sha || github.sha }}
 
-      - name: Déployer sur la VM (docker compose via SSH)
+      - name: Deploy to VPS
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
           VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
           POSTGRES_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          IMAGE: ${{ env.IMAGE }}
+          SCHEDULE_SECONDS: "300"
+
         run: |
+          set -euo pipefail
+
           install -m 600 /dev/null key
+          trap 'rm -f key' EXIT
           printf '%s\n' "$VM_SSH_KEY" > key
-          SSH="ssh -i key -o StrictHostKeyChecking=accept-new $VM_USER@$VM_HOST"
-          $SSH "mkdir -p ~/pipeline"
-          scp -i key -o StrictHostKeyChecking=accept-new docker-compose.prod.yml "$VM_USER@$VM_HOST:~/pipeline/docker-compose.prod.yml"
-          $SSH 'bash -s' <<REMOTE
-          set -e
-          cd ~/pipeline
-          printf 'POSTGRES_PASSWORD=%s\nPIPELINE_IMAGE=%s:latest\n' '$POSTGRES_PASSWORD' '$IMAGE' > .env
-          echo '$GHCR_TOKEN' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
-          docker compose -f docker-compose.prod.yml pull
-          docker compose -f docker-compose.prod.yml up -d
-          docker compose -f docker-compose.prod.yml ps
+
+          REMOTE_DIR="/home/ubuntu/financial-pipeline/runtime"
+
+          ssh -i key -o StrictHostKeyChecking=accept-new \
+            "$VM_USER@$VM_HOST" "mkdir -p '$REMOTE_DIR'"
+
+          scp -i key -o StrictHostKeyChecking=accept-new \
+            docker-compose.prod.yml \
+            "$VM_USER@$VM_HOST:$REMOTE_DIR/docker-compose.prod.yml"
+
+          ssh -i key -o StrictHostKeyChecking=accept-new \
+            "$VM_USER@$VM_HOST" 'bash -s' <<REMOTE
+          set -euo pipefail
+
+          cd /home/ubuntu/financial-pipeline/runtime
+
+          printf 'POSTGRES_PASSWORD=%s\nPIPELINE_IMAGE=%s:latest\nSCHEDULE_SECONDS=%s\n' \
+            '$POSTGRES_PASSWORD' '$IMAGE' '$SCHEDULE_SECONDS' > .env
+
+          chmod 600 .env
+
+          echo '$GHCR_TOKEN' | docker login ghcr.io \
+            -u '$GITHUB_ACTOR' --password-stdin
+
+          docker compose -p financial-pipeline \
+            -f docker-compose.prod.yml pull
+
+          docker compose -p financial-pipeline \
+            -f docker-compose.prod.yml up -d --remove-orphans
+
+          docker compose -p financial-pipeline \
+            -f docker-compose.prod.yml ps
           REMOTE
-          rm -f key
