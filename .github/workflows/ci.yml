@@ -581,15 +581,20 @@ jobs:
 
   docker-build:
     name: "8 - Docker image build"
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Windows]
     needs: pipeline-e2e
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Build application image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: false
-          tags: financial-data-pipeline:ci
+        run: |
+          docker build -t financial-data-pipeline:ci .
+          exit $LASTEXITCODE
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if (docker images -q financial-data-pipeline:ci) { docker rmi -f financial-data-pipeline:ci }
+          exit 0
