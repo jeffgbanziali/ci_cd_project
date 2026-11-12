@@ -653,41 +653,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      - name: Validate production prerequisites
-        run: |
-          $ErrorActionPreference = "Stop"
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
 
-          foreach ($name in @(
-            "VM_HOST",
-            "VM_USER",
-            "VM_PASSWORD",
-            "PROD_POSTGRES_PASSWORD",
-            "TF_VAR_ssh_password"
-          )) {
-            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
-              throw "Secret ou variable manquant : $name"
-            }
-          }
-
-          foreach ($tool in @("docker", "python", "terraform")) {
-            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-              throw "Outil introuvable sur le runner : $tool"
-            }
-          }
-
-          $dockerOS = docker info --format '{{.OSType}}'
-          if ($LASTEXITCODE -ne 0 -or $dockerOS -ne "linux") {
-            throw "Docker doit fonctionner en mode conteneurs Linux."
-          }
-
-          if (-not (Test-Path "Dockerfile")) {
-            throw "Dockerfile introuvable."
-          }
-          if (-not (Test-Path "docker-compose.prod.yml")) {
-            throw "docker-compose.prod.yml introuvable."
-          }
-
-          Write-Host "Prérequis de production vérifiés."
 
       - name: Build and export Docker image
         run: |
