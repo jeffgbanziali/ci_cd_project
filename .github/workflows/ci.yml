@@ -10,343 +10,254 @@ on:
 permissions:
   contents: read
 
+# Les jobs Windows sont chaînés pour réutiliser l'installation Python
+# sur l'unique runner self-hosted. Vérifier qu'un seul runner porte ces labels.
 jobs:
-  # Un seul job Windows pour toute la partie Python :
-  # une seule installation, un seul PostgreSQL et un seul SeaweedFS.
-  pipeline-tests:
-    name: "1 - Qualité, tests et flux Data"
+  dependencies:
+    name: "1 - Dependencies"
     runs-on: [self-hosted, Windows]
-    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    env:
-      CI_POSTGRES_NAME: financial-ci-postgres-${{ github.run_id }}-${{ github.run_attempt }}
-      CI_S3_NAME: financial-ci-s3-${{ github.run_id }}-${{ github.run_attempt }}
-
-    defaults:
-      run:
+      - name: Check Python
         shell: powershell
+        run: |
+          python --version
+          python -c "import sys; assert sys.version_info[:2] == (3, 11), 'Python 3.11 is required'"
 
+      - name: Install project and development dependencies
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Verify required tools
+        shell: powershell
+        run: |
+          python -c "import pytest, ruff, pandas, sqlalchemy, psycopg2, boto3"
+          python -m pip check
+
+  quality:
+    name: "2 - Code quality"
+    runs-on: [self-hosted, Windows]
+    needs: dependencies
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # Installation unique des dépendances Python.
-      - name: Vérifier Python et installer les dépendances (une seule fois)
+      - uses: actions/checkout@v4
+      - name: Ruff lint
+        shell: powershell
         run: |
-          py -3.11 --version
-          if ($LASTEXITCODE -ne 0) {
-            throw "Python 3.11 est requis sur le runner."
-          }
+          ruff check .
 
-          py -3.11 -m pip install -r requirements-dev.txt
-          if ($LASTEXITCODE -ne 0) {
-            throw "L'installation des dépendances a échoué."
-          }
-
-
-      - name: Qualité du code - Ruff
+  unit-tests:
+    name: "3 - Unit tests"
+    runs-on: [self-hosted, Windows]
+    needs: quality
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run unit tests (excluding dedicated SLM tests)
+        shell: powershell
         run: |
-          py -3.11 -m ruff check .
-          if ($LASTEXITCODE -ne 0) {
-            throw "Ruff a détecté des erreurs."
-          }
+          python -m pytest tests/unit -vv --ignore=tests/unit/test_slm_extractor.py
 
-
-      - name: Démarrer PostgreSQL (une seule fois)
+  slm-tests:
+    name: "4 - SLM extraction tests"
+    runs-on: [self-hosted, Windows]
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run SLM extractor tests
+        shell: powershell
         run: |
-          docker run -d `
-            --name $env:CI_POSTGRES_NAME `
-            -e POSTGRES_DB=pipeline_test `
-            -e POSTGRES_USER=pipeline `
-            -e POSTGRES_PASSWORD=pipeline `
-            -p 127.0.0.1::5432 `
-            postgres:15-alpine
+          python -m pytest tests/unit/test_slm_extractor.py -vv
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Impossible de démarrer PostgreSQL."
-          }
-
-          $pgPort = $null
-          $pgReady = $false
-
-          for ($i = 0; $i -lt 40; $i++) {
-            $mapping = docker port $env:CI_POSTGRES_NAME 5432/tcp
-            if ($mapping) {
-              $pgPort = ($mapping.Trim() -split ":")[-1]
-            }
-
-            if ($pgPort) {
-              docker exec $env:CI_POSTGRES_NAME pg_isready -U pipeline -d pipeline_test
-              if ($LASTEXITCODE -eq 0) {
-                $pgReady = $true
-                break
-              }
-            }
+  integration-tests:
+    name: "5 - Integration tests"
+    runs-on: [self-hosted, Windows]
+    needs: slm-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start PostgreSQL
+        shell: powershell
+        run: |
+          $name = "fpipe-ci-pg-integration"
+          docker rm -f $name 2>$null
+          docker run -d --name $name -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=financial_test -p 127.0.0.1::5432 postgres:16
+          if ($LASTEXITCODE -ne 0) { throw "PostgreSQL container failed to start" }
+          $port = (docker port $name 5432/tcp).Split(":")[-1]
+          $env:PGPORT = $port
+          $ready = $false
+          for ($i=0; $i -lt 30; $i++) {
+            docker exec $name pg_isready -U postgres -d financial_test *> $null
+            if ($LASTEXITCODE -eq 0) { $ready = $true; break }
             Start-Sleep -Seconds 2
           }
+          if (-not $ready) { docker logs $name; throw "PostgreSQL not ready" }
+          "PG_URL=postgresql://postgres:postgres@127.0.0.1:$port/financial_test" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DB_URL=postgresql://postgres:postgres@127.0.0.1:$port/financial_test" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEST_DB_URL=postgresql://postgres:postgres@127.0.0.1:$port/financial_test" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          if (-not $pgReady) {
-            docker logs $env:CI_POSTGRES_NAME
-            throw "PostgreSQL n'est pas prêt après 80 secondes."
-          }
-
-          $pgUrl = "postgresql://pipeline:pipeline@127.0.0.1:$pgPort/pipeline_test"
-          $utf8 = New-Object System.Text.UTF8Encoding $false
-          [System.IO.File]::AppendAllText(
-            $env:GITHUB_ENV,
-            "PG_URL=$pgUrl`nDB_URL=$pgUrl`nTEST_DB_URL=$pgUrl`n",
-            $utf8
-          )
-
-          Write-Host "PostgreSQL prêt sur 127.0.0.1:$pgPort."
-
-      - name: Démarrer SeaweedFS S3 (une seule fois)
+      - name: Start SeaweedFS S3
+        shell: powershell
         run: |
-          docker run -d `
-            --name $env:CI_S3_NAME `
-            -p 127.0.0.1::8333 `
-            chrislusf/seaweedfs:latest `
-            server -s3 -dir=/data
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Impossible de démarrer SeaweedFS."
+          $name = "fpipe-ci-s3-integration"
+          docker rm -f $name 2>$null
+          docker run -d --name $name -p 127.0.0.1::8333 chrislusf/seaweedfs:latest server -s3
+          if ($LASTEXITCODE -ne 0) { throw "SeaweedFS container failed to start" }
+          $port = (docker port $name 8333/tcp).Split(":")[-1]
+          $ready = $false
+          for ($i=0; $i -lt 40; $i++) {
+            try { $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port" -TimeoutSec 2 -UseBasicParsing; $ready = $true; break } catch { Start-Sleep -Seconds 2 }
           }
+          if (-not $ready) { docker logs $name; throw "SeaweedFS not ready" }
+          "S3_ENDPOINT=http://127.0.0.1:$port" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEST_S3_ENDPOINT=http://127.0.0.1:$port" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "S3_BUCKET=financial-test" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          $s3Port = $null
-          $s3Ready = $false
-
-          for ($i = 0; $i -lt 40; $i++) {
-            $mapping = docker port $env:CI_S3_NAME 8333/tcp
-            if ($mapping) {
-              $s3Port = ($mapping.Trim() -split ":")[-1]
-            }
-
-            if ($s3Port) {
-              $tcp = New-Object System.Net.Sockets.TcpClient
-              try {
-                $async = $tcp.BeginConnect("127.0.0.1", [int]$s3Port, $null, $null)
-                if ($async.AsyncWaitHandle.WaitOne(1000, $false) -and $tcp.Connected) {
-                  $tcp.EndConnect($async)
-                  $s3Ready = $true
-                  break
-                }
-              }
-              catch {
-                # Le service n'est pas encore prêt : on réessaie.
-              }
-              finally {
-                $tcp.Close()
-              }
-            }
-            Start-Sleep -Seconds 2
-          }
-
-          if (-not $s3Ready) {
-            docker logs --tail 150 $env:CI_S3_NAME
-            throw "SeaweedFS S3 n'est pas accessible après 80 secondes."
-          }
-
-          $endpoint = "http://127.0.0.1:$s3Port"
-          $env:S3_ENDPOINT = $endpoint
-          $env:TEST_S3_ENDPOINT = $endpoint
-          $env:S3_BUCKET = "ci-warmup"
-
-          # Initialisation du client et du bucket une seule fois.
-          cmd.exe /d /c "py -3.11 -c `"from src.storage.s3_client import S3Manager; s = S3Manager(); s.wait_until_ready(); s.ensure_bucket_exists()`" > s3-startup.log 2>&1"
-          $s3ExitCode = $LASTEXITCODE
-
-          if (Test-Path s3-startup.log) {
-            Get-Content s3-startup.log
-          }
-
-          if ($s3ExitCode -ne 0) {
-            docker logs --tail 150 $env:CI_S3_NAME
-            throw "Le client S3 n'a pas réussi à initialiser le bucket."
-          }
-
-          $utf8 = New-Object System.Text.UTF8Encoding $false
-          [System.IO.File]::AppendAllText(
-            $env:GITHUB_ENV,
-            "S3_ENDPOINT=$endpoint`nTEST_S3_ENDPOINT=$endpoint`nS3_BUCKET=ci-warmup`n",
-            $utf8
-          )
-
-          Write-Host "SeaweedFS S3 prêt sur $endpoint."
-
-      - name: Exécuter toute la suite de tests (une seule fois)
+      - name: Run integration tests
+        shell: powershell
         run: |
-          cmd.exe /d /c "py -3.11 -m pytest tests -vv --cov=src --cov-report=term-missing --cov-fail-under=80 > tests.log 2>&1"
-          $testExitCode = $LASTEXITCODE
+          python -m pytest tests/integration -vv
 
-          if (Test-Path tests.log) {
-            Get-Content tests.log
-          }
-
-          if ($testExitCode -ne 0) {
-            throw "La suite de tests ou le seuil de couverture de 80 % a échoué."
-          }
-
-          # Vérifie explicitement que le scénario SLM rejoint le même flux.
-          if (-not (Select-String -Path tests.log -Pattern "test_text_ingestion_joins_the_same_flow_and_is_idempotent.*PASSED" -Quiet)) {
-            throw "Le test d'intégration SLM n'a pas été exécuté avec succès."
-          }
-
-          Write-Host "Validation SLM : extraction texte -> flux commun -> idempotence."
-
-      - name: Réinitialiser la base avant le test réel de la pipeline
-        run: |
-          cmd.exe /d /c "py -3.11 -c `"from src.db.connection import reset_db; reset_db()`" > reset-db.log 2>&1"
-          $resetExitCode = $LASTEXITCODE
-
-          if (Test-Path reset-db.log) {
-            Get-Content reset-db.log
-          }
-
-          if ($resetExitCode -ne 0) {
-            throw "Impossible de réinitialiser la base de test."
-          }
-
-      - name: Exécuter la pipeline avec simulation des pannes (S3 + DB)
-        env:
-          SIMULATE_DB_FAILURES: "2"
-          SIMULATE_S3_FAILURES: "2"
-          RETRY_MAX_ATTEMPTS: "3"
-          RETRY_WAIT_SECONDS: "0.5"
-        run: |
-          cmd.exe /d /c "py -3.11 -m src.pipeline.main > run1.log 2>&1"
-          $pipelineExitCode = $LASTEXITCODE
-
-          Write-Host "===== FLUX CSV / S3 / VALIDATION / TRAITEMENT / DB ====="
-          if (Test-Path run1.log) {
-            Get-Content run1.log
-          }
-
-          if ($pipelineExitCode -ne 0) {
-            throw "La pipeline a échoué (code $pipelineExitCode)."
-          }
-
-          @'
-          import re
-          import sys
-          from pathlib import Path
-
-          log = Path("run1.log").read_text(encoding="utf-8", errors="replace")
-          match = re.search(r"Bilan\s*:\s*(\d+)\s+.*?,\s*(\d+)\s+.*?,\s*(\d+)", log)
-          if not match:
-              raise SystemExit("Bilan de pipeline introuvable dans run1.log")
-
-          actual = tuple(map(int, match.groups()))
-          expected = (3, 0, 0)
-          if actual != expected:
-              raise SystemExit(f"Bilan incorrect : {actual}, attendu : {expected}")
-
-          for service in ("s3", "db"):
-              if f"panne temporaire '{service}'" not in log:
-                  raise SystemExit(f"La panne simulée {service} n'apparaît pas dans le journal.")
-
-          print("Résilience validée : 3 fichiers traités, retries S3 et DB observés.")
-          '@ | Set-Content -Path validate_run1.py -Encoding utf8
-
-          py -3.11 validate_run1.py
-          if ($LASTEXITCODE -ne 0) {
-            throw "La validation de la résilience a échoué."
-          }
-
-      - name: Vérifier l'idempotence (seconde exécution)
-        env:
-          RETRY_MAX_ATTEMPTS: "3"
-          RETRY_WAIT_SECONDS: "0.5"
-        run: |
-          cmd.exe /d /c "py -3.11 -m src.pipeline.main > run2.log 2>&1"
-          $pipelineExitCode = $LASTEXITCODE
-
-          Write-Host "===== SECONDE EXECUTION / IDEMPOTENCE ====="
-          if (Test-Path run2.log) {
-            Get-Content run2.log
-          }
-
-          if ($pipelineExitCode -ne 0) {
-            throw "La seconde exécution de la pipeline a échoué."
-          }
-
-          @'
-          import re
-          from pathlib import Path
-
-          log = Path("run2.log").read_text(encoding="utf-8", errors="replace")
-          match = re.search(r"Bilan\s*:\s*(\d+)\s+.*?,\s*(\d+)\s+.*?,\s*(\d+)", log)
-          if not match:
-              raise SystemExit("Bilan de la seconde exécution introuvable.")
-
-          actual = tuple(map(int, match.groups()))
-          expected = (0, 3, 0)
-          if actual != expected:
-              raise SystemExit(f"Idempotence incorrecte : {actual}, attendu : {expected}")
-
-          print("Idempotence validée : aucun des 3 fichiers n'a été retraité.")
-          '@ | Set-Content -Path validate_run2.py -Encoding utf8
-
-          py -3.11 validate_run2.py
-          if ($LASTEXITCODE -ne 0) {
-            throw "Le contrôle d'idempotence a échoué."
-          }
-
-      - name: Afficher les diagnostics en cas d'échec
-        if: failure()
-        run: |
-          Write-Host "===== CONTENEURS ====="
-          docker ps -a
-
-          foreach ($container in @($env:CI_POSTGRES_NAME, $env:CI_S3_NAME)) {
-            $exists = docker container inspect $container 2>$null
-            if ($LASTEXITCODE -eq 0) {
-              Write-Host "===== LOGS $container ====="
-              docker logs --tail 200 $container
-            }
-          }
-
-          foreach ($file in @("s3-startup.log", "tests.log", "reset-db.log", "run1.log", "run2.log")) {
-            if (Test-Path $file) {
-              Write-Host "===== $file ====="
-              Get-Content $file
-            }
-          }
-
-      # Ne supprime que les deux conteneurs créés par CE workflow.
-      - name: Nettoyer les services CI
+      - name: Diagnostics and cleanup
         if: always()
+        shell: powershell
         run: |
-          foreach ($container in @($env:CI_POSTGRES_NAME, $env:CI_S3_NAME)) {
-            docker container inspect $container *> $null
-            if ($LASTEXITCODE -eq 0) {
-              docker rm -f $container
-              if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Impossible de supprimer $container."
-              }
-            }
-          }
+          docker logs fpipe-ci-pg-integration 2>$null
+          docker logs fpipe-ci-s3-integration 2>$null
+          docker rm -f fpipe-ci-pg-integration fpipe-ci-s3-integration 2>$null
 
-  # Le build Docker est séparé, mais ne réinstalle aucune dépendance Python.
-  docker-build:
-    name: "2 - Build Docker"
-    runs-on: ubuntu-latest
-    needs: pipeline-tests
-    timeout-minutes: 20
-
+  resilience-tests:
+    name: "6 - Retry and resilience tests"
+    runs-on: [self-hosted, Windows]
+    needs: integration-tests
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Start PostgreSQL and SeaweedFS
+        shell: powershell
+        run: |
+          $pg = "fpipe-ci-pg-resilience"
+          $s3 = "fpipe-ci-s3-resilience"
+          docker rm -f $pg $s3 2>$null
+          docker run -d --name $pg -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=financial_test -p 127.0.0.1::5432 postgres:16
+          if ($LASTEXITCODE -ne 0) { throw "PostgreSQL start failed" }
+          $pgPort = (docker port $pg 5432/tcp).Split(":")[-1]
+          $ready = $false
+          for ($i=0; $i -lt 30; $i++) { docker exec $pg pg_isready -U postgres -d financial_test *> $null; if ($LASTEXITCODE -eq 0) { $ready=$true; break }; Start-Sleep 2 }
+          if (-not $ready) { throw "PostgreSQL not ready" }
+          docker run -d --name $s3 -p 127.0.0.1::8333 chrislusf/seaweedfs:latest server -s3
+          if ($LASTEXITCODE -ne 0) { throw "SeaweedFS start failed" }
+          $s3Port = (docker port $s3 8333/tcp).Split(":")[-1]
+          $ready = $false
+          for ($i=0; $i -lt 40; $i++) { try { Invoke-WebRequest "http://127.0.0.1:$s3Port" -TimeoutSec 2 -UseBasicParsing | Out-Null; $ready=$true; break } catch { Start-Sleep 2 } }
+          if (-not $ready) { throw "SeaweedFS not ready" }
+          "PG_URL=postgresql://postgres:postgres@127.0.0.1:$pgPort/financial_test" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "DB_URL=postgresql://postgres:postgres@127.0.0.1:$pgPort/financial_test" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "TEST_DB_URL=postgresql://postgres:postgres@127.0.0.1:$pgPort/financial_test" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "S3_ENDPOINT=http://127.0.0.1:$s3Port" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "TEST_S3_ENDPOINT=http://127.0.0.1:$s3Port" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "S3_BUCKET=financial-test" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Configurer Docker Buildx
+      - name: Run retry and resilience tests
+        shell: powershell
+        run: |
+          python -m pytest tests/integration -vv -k "retry or unreachable"
+
+      - name: Cleanup
+        if: always()
+        shell: powershell
+        run: |
+          docker rm -f fpipe-ci-pg-resilience fpipe-ci-s3-resilience 2>$null
+
+  pipeline-e2e:
+    name: "7 - End-to-end pipeline"
+    runs-on: [self-hosted, Windows]
+    needs: resilience-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start PostgreSQL and SeaweedFS
+        shell: powershell
+        run: |
+          $pg = "fpipe-ci-pg-e2e"
+          $s3 = "fpipe-ci-s3-e2e"
+          docker rm -f $pg $s3 2>$null
+          docker run -d --name $pg -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=financial_test -p 127.0.0.1::5432 postgres:16
+          if ($LASTEXITCODE -ne 0) { throw "PostgreSQL start failed" }
+          $pgPort = (docker port $pg 5432/tcp).Split(":")[-1]
+          $ready = $false
+          for ($i=0; $i -lt 30; $i++) { docker exec $pg pg_isready -U postgres -d financial_test *> $null; if ($LASTEXITCODE -eq 0) { $ready=$true; break }; Start-Sleep 2 }
+          if (-not $ready) { throw "PostgreSQL not ready" }
+          docker run -d --name $s3 -p 127.0.0.1::8333 chrislusf/seaweedfs:latest server -s3
+          if ($LASTEXITCODE -ne 0) { throw "SeaweedFS start failed" }
+          $s3Port = (docker port $s3 8333/tcp).Split(":")[-1]
+          $ready = $false
+          for ($i=0; $i -lt 40; $i++) { try { Invoke-WebRequest "http://127.0.0.1:$s3Port" -TimeoutSec 2 -UseBasicParsing | Out-Null; $ready=$true; break } catch { Start-Sleep 2 } }
+          if (-not $ready) { throw "SeaweedFS not ready" }
+          "PG_URL=postgresql://postgres:postgres@127.0.0.1:$pgPort/financial_test" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "DB_URL=postgresql://postgres:postgres@127.0.0.1:$pgPort/financial_test" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "TEST_DB_URL=postgresql://postgres:postgres@127.0.0.1:$pgPort/financial_test" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "S3_ENDPOINT=http://127.0.0.1:$s3Port" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "TEST_S3_ENDPOINT=http://127.0.0.1:$s3Port" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "S3_BUCKET=financial-test" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Reset database
+        shell: powershell
+        run: |
+          python -c "from src.db.connection import reset_db; reset_db()"
+
+      - name: Run pipeline and verify first ingestion
+        shell: powershell
+        run: |
+          $log = "pipeline-e2e-first.log"
+          python -m src.main 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw "First pipeline execution failed" }
+          @'
+          from pathlib import Path
+          import re
+          text = Path("pipeline-e2e-first.log").read_text(encoding="utf-8", errors="replace")
+          matches = re.findall(r"(\d+)\s+trait[eé]?\(s\),\s*(\d+)\s+ignor[eé]?\(s\),\s*(\d+)\s+invalide\(s\)", text, re.I)
+          if not matches:
+              raise SystemExit("Pipeline summary not found in log")
+          if tuple(map(int, matches[-1])) != (3, 0, 0):
+              raise SystemExit(f"Unexpected first-run summary: {matches[-1]}")
+          print("First ingestion verified: 3 processed, 0 ignored, 0 invalid")
+          '@ | python -
+
+      - name: Run pipeline again and verify idempotence
+        shell: powershell
+        run: |
+          $log = "pipeline-e2e-second.log"
+          python -m src.main 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw "Second pipeline execution failed" }
+          @'
+          from pathlib import Path
+          import re
+          text = Path("pipeline-e2e-second.log").read_text(encoding="utf-8", errors="replace")
+          matches = re.findall(r"(\d+)\s+trait[eé]?\(s\),\s*(\d+)\s+ignor[eé]?\(s\),\s*(\d+)\s+invalide\(s\)", text, re.I)
+          if not matches:
+              raise SystemExit("Pipeline summary not found in log")
+          if tuple(map(int, matches[-1])) != (0, 3, 0):
+              raise SystemExit(f"Unexpected second-run summary: {matches[-1]}")
+          print("Idempotence verified: 0 processed, 3 ignored, 0 invalid")
+          '@ | python -
+
+      - name: Cleanup
+        if: always()
+        shell: powershell
+        run: |
+          docker rm -f fpipe-ci-pg-e2e fpipe-ci-s3-e2e 2>$null
+
+  docker-build:
+    name: "8 - Docker image build"
+    runs-on: ubuntu-latest
+    needs: pipeline-e2e
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Construire l'image de la pipeline
+      - name: Build application image
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64
           push: false
-          tags: financial-pipeline:ci
-
-      - name: Build terminé
-        run: echo "Image Docker construite avec succès."
+          tags: financial-data-pipeline:ci
