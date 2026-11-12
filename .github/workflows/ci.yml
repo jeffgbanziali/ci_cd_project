@@ -1,4 +1,3 @@
-
 name: Financial Data Pipeline CI
 
 on:
@@ -12,7 +11,6 @@ permissions:
   contents: read
 
 jobs:
-
   # =====================================================
   # JOB 1 - CODE QUALITY
   # =====================================================
@@ -81,7 +79,9 @@ jobs:
           cmd.exe /d /c "py -3.11 -m pytest tests/unit -v > unit-tests.log 2>&1"
           $exitCode = $LASTEXITCODE
 
-          Get-Content unit-tests.log
+          if (Test-Path unit-tests.log) {
+            Get-Content unit-tests.log
+          }
 
           if ($exitCode -ne 0) {
             throw "Les tests unitaires ont échoué."
@@ -153,12 +153,12 @@ jobs:
 
           if (-not $pgReady) {
             docker logs $env:CI_POSTGRES_NAME
-            throw "PostgreSQL ne répond pas."
+            throw "PostgreSQL ne répond pas après 60 secondes."
           }
 
           $pgUrl = "postgresql://pipeline:pipeline@127.0.0.1:$pgPort/pipeline_test"
-
           $utf8 = New-Object System.Text.UTF8Encoding $false
+
           [System.IO.File]::AppendAllText(
             $env:GITHUB_ENV,
             "TEST_DB_URL=$pgUrl`n",
@@ -167,7 +167,7 @@ jobs:
 
           Write-Host "PostgreSQL prêt sur le port $pgPort."
 
-      - name: Démarrer SeaweedFS
+      - name: Démarrer et vérifier SeaweedFS S3
         run: |
           docker run -d `
             --name $env:CI_S3_NAME `
@@ -180,8 +180,9 @@ jobs:
           }
 
           $s3Port = $null
-          $s3Ready = $false
+          $s3PortReady = $false
 
+          # Attendre l'ouverture du port TCP S3 (maximum 60 secondes).
           for ($i = 0; $i -lt 30; $i++) {
             $mapping = docker port $env:CI_S3_NAME 8333/tcp
 
@@ -190,44 +191,76 @@ jobs:
             }
 
             if ($s3Port) {
-              $endpoint = "http://127.0.0.1:$s3Port"
-              $env:TEST_S3_ENDPOINT = $endpoint
+              $tcp = New-Object System.Net.Sockets.TcpClient
 
-              cmd.exe /d /c "py -3.11 -c `"from src.storage.s3_client import S3Manager; s = S3Manager(); s.wait_until_ready(max_attempts=1, wait_seconds=0); s.ensure_bucket_exists()`" > s3-startup.log 2>&1"
+              try {
+                $connect = $tcp.BeginConnect("127.0.0.1", [int]$s3Port, $null, $null)
+                $connected = $connect.AsyncWaitHandle.WaitOne(1000, $false)
 
-              if ($LASTEXITCODE -eq 0) {
-                $s3Ready = $true
-                break
+                if ($connected -and $tcp.Connected) {
+                  $tcp.EndConnect($connect)
+                  $s3PortReady = $true
+                  break
+                }
+              }
+              catch {
+                # Le port n'est pas encore prêt : nouvelle tentative.
+              }
+              finally {
+                $tcp.Close()
               }
             }
 
             Start-Sleep -Seconds 2
           }
 
-          if (-not $s3Ready) {
-            if (Test-Path s3-startup.log) {
-              Get-Content s3-startup.log
-            }
+          if (-not $s3PortReady) {
+            docker logs --tail 150 $env:CI_S3_NAME
+            throw "Le port S3 de SeaweedFS n'est pas accessible après 60 secondes."
+          }
 
-            docker logs $env:CI_S3_NAME
-            throw "SeaweedFS ne répond pas."
+          $endpoint = "http://127.0.0.1:$s3Port"
+
+          # IMPORTANT : S3Manager utilise S3_ENDPOINT.
+          # TEST_S3_ENDPOINT est également fourni pour les fixtures de tests.
+          $env:S3_ENDPOINT = $endpoint
+          $env:TEST_S3_ENDPOINT = $endpoint
+          $env:S3_BUCKET = "transactions-test"
+
+          Write-Host "Port S3 accessible : $endpoint"
+          Write-Host "Vérification du client S3 et création du bucket..."
+
+          # Appeler le client une seule fois après ouverture du port.
+          # wait_until_ready() applique les retries configurés dans le code Python.
+          cmd.exe /d /c "py -3.11 -c `"from src.storage.s3_client import S3Manager; s = S3Manager(); s.wait_until_ready(); s.ensure_bucket_exists()`" > s3-startup.log 2>&1"
+          $s3ExitCode = $LASTEXITCODE
+
+          if (Test-Path s3-startup.log) {
+            Get-Content s3-startup.log
+          }
+
+          if ($s3ExitCode -ne 0) {
+            docker logs --tail 150 $env:CI_S3_NAME
+            throw "Le port S3 répond, mais S3Manager ne parvient pas à initialiser le bucket."
           }
 
           $utf8 = New-Object System.Text.UTF8Encoding $false
           [System.IO.File]::AppendAllText(
             $env:GITHUB_ENV,
-            "TEST_S3_ENDPOINT=$endpoint`n",
+            "S3_ENDPOINT=$endpoint`nTEST_S3_ENDPOINT=$endpoint`nS3_BUCKET=transactions-test`n",
             $utf8
           )
 
-          Write-Host "SeaweedFS prêt sur $endpoint."
+          Write-Host "SeaweedFS S3 est opérationnel sur $endpoint."
 
       - name: Exécuter les tests d'intégration et vérifier la couverture
         run: |
           cmd.exe /d /c "py -3.11 -m pytest tests -v --cov=src --cov-report=term-missing --cov-fail-under=80 > integration-tests.log 2>&1"
           $exitCode = $LASTEXITCODE
 
-          Get-Content integration-tests.log
+          if (Test-Path integration-tests.log) {
+            Get-Content integration-tests.log
+          }
 
           if ($exitCode -ne 0) {
             throw "Les tests d'intégration ou le seuil de couverture ont échoué."
@@ -242,12 +275,16 @@ jobs:
             $id = docker ps -aq --filter "name=^$container$"
 
             if ($id) {
-              docker logs --tail 100 $container
+              Write-Host "===== Logs : $container ====="
+              docker logs --tail 150 $container
             }
           }
 
-          if (Test-Path integration-tests.log) {
-            Get-Content integration-tests.log
+          foreach ($file in @("s3-startup.log", "integration-tests.log")) {
+            if (Test-Path $file) {
+              Write-Host "===== Fichier : $file ====="
+              Get-Content $file
+            }
           }
 
       - name: Nettoyer les conteneurs
@@ -261,18 +298,8 @@ jobs:
             }
           }
 
-      - name: Archiver les résultats
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: integration-tests-logs
-          path: |
-            integration-tests.log
-            s3-startup.log
-          if-no-files-found: ignore
-
   # =====================================================
-  # JOB 4 - RESILIENCE TESTS
+  # JOB 4 - RESILIENCE & IDEMPOTENCE
   # =====================================================
   resilience-tests:
     name: "4 - Resilience & Idempotence Tests"
@@ -337,19 +364,21 @@ jobs:
 
           if (-not $pgReady) {
             docker logs $env:CI_POSTGRES_NAME
-            throw "PostgreSQL ne répond pas."
+            throw "PostgreSQL ne répond pas après 60 secondes."
           }
 
           $pgUrl = "postgresql://pipeline:pipeline@127.0.0.1:$pgPort/pipeline_test"
-
           $utf8 = New-Object System.Text.UTF8Encoding $false
+
           [System.IO.File]::AppendAllText(
             $env:GITHUB_ENV,
             "DB_URL=$pgUrl`n",
             $utf8
           )
 
-      - name: Démarrer SeaweedFS
+          Write-Host "PostgreSQL prêt sur le port $pgPort."
+
+      - name: Démarrer et vérifier SeaweedFS S3
         run: |
           docker run -d `
             --name $env:CI_S3_NAME `
@@ -362,7 +391,7 @@ jobs:
           }
 
           $s3Port = $null
-          $s3Ready = $false
+          $s3PortReady = $false
 
           for ($i = 0; $i -lt 30; $i++) {
             $mapping = docker port $env:CI_S3_NAME 8333/tcp
@@ -372,41 +401,67 @@ jobs:
             }
 
             if ($s3Port) {
-              $endpoint = "http://127.0.0.1:$s3Port"
-              $env:S3_ENDPOINT = $endpoint
-              $env:S3_BUCKET = "transactions-test"
+              $tcp = New-Object System.Net.Sockets.TcpClient
 
-              cmd.exe /d /c "py -3.11 -c `"from src.storage.s3_client import S3Manager; s = S3Manager(); s.wait_until_ready(max_attempts=1, wait_seconds=0); s.ensure_bucket_exists()`" > s3-startup.log 2>&1"
+              try {
+                $connect = $tcp.BeginConnect("127.0.0.1", [int]$s3Port, $null, $null)
+                $connected = $connect.AsyncWaitHandle.WaitOne(1000, $false)
 
-              if ($LASTEXITCODE -eq 0) {
-                $s3Ready = $true
-                break
+                if ($connected -and $tcp.Connected) {
+                  $tcp.EndConnect($connect)
+                  $s3PortReady = $true
+                  break
+                }
+              }
+              catch {
+                # Le port n'est pas encore prêt : nouvelle tentative.
+              }
+              finally {
+                $tcp.Close()
               }
             }
 
             Start-Sleep -Seconds 2
           }
 
-          if (-not $s3Ready) {
-            if (Test-Path s3-startup.log) {
-              Get-Content s3-startup.log
-            }
+          if (-not $s3PortReady) {
+            docker logs --tail 150 $env:CI_S3_NAME
+            throw "Le port S3 de SeaweedFS n'est pas accessible après 60 secondes."
+          }
 
-            docker logs $env:CI_S3_NAME
-            throw "SeaweedFS ne répond pas."
+          $endpoint = "http://127.0.0.1:$s3Port"
+          $env:S3_ENDPOINT = $endpoint
+          $env:TEST_S3_ENDPOINT = $endpoint
+          $env:S3_BUCKET = "transactions-test"
+
+          Write-Host "Port S3 accessible : $endpoint"
+
+          cmd.exe /d /c "py -3.11 -c `"from src.storage.s3_client import S3Manager; s = S3Manager(); s.wait_until_ready(); s.ensure_bucket_exists()`" > s3-startup.log 2>&1"
+          $s3ExitCode = $LASTEXITCODE
+
+          if (Test-Path s3-startup.log) {
+            Get-Content s3-startup.log
+          }
+
+          if ($s3ExitCode -ne 0) {
+            docker logs --tail 150 $env:CI_S3_NAME
+            throw "S3Manager n'a pas pu initialiser le bucket."
           }
 
           $utf8 = New-Object System.Text.UTF8Encoding $false
           [System.IO.File]::AppendAllText(
             $env:GITHUB_ENV,
-            "S3_ENDPOINT=$endpoint`nS3_BUCKET=transactions-test`n",
+            "S3_ENDPOINT=$endpoint`nTEST_S3_ENDPOINT=$endpoint`nS3_BUCKET=transactions-test`n",
             $utf8
           )
 
+          Write-Host "SeaweedFS S3 est opérationnel sur $endpoint."
+
       - name: Vérifier les connexions
         run: |
-          Write-Host "DB_URL=$env:DB_URL"
+          Write-Host "PostgreSQL et SeaweedFS ont passé leurs contrôles de disponibilité."
           Write-Host "S3_ENDPOINT=$env:S3_ENDPOINT"
+          Write-Host "S3_BUCKET=$env:S3_BUCKET"
 
       - name: Tester la résilience aux pannes
         env:
@@ -419,7 +474,9 @@ jobs:
           $exitCode = $LASTEXITCODE
 
           Write-Host "=== EXECUTION AVEC PANNES SIMULEES ==="
-          Get-Content run1.log
+          if (Test-Path run1.log) {
+            Get-Content run1.log
+          }
 
           if ($exitCode -ne 0) {
             throw "La pipeline a échoué avec le code $exitCode."
@@ -448,7 +505,9 @@ jobs:
           $exitCode = $LASTEXITCODE
 
           Write-Host "=== SECONDE EXECUTION ==="
-          Get-Content run2.log
+          if (Test-Path run2.log) {
+            Get-Content run2.log
+          }
 
           if ($exitCode -ne 0) {
             throw "La seconde exécution a échoué."
@@ -469,12 +528,14 @@ jobs:
             $id = docker ps -aq --filter "name=^$container$"
 
             if ($id) {
-              docker logs --tail 100 $container
+              Write-Host "===== Logs : $container ====="
+              docker logs --tail 150 $container
             }
           }
 
           foreach ($file in @("s3-startup.log", "run1.log", "run2.log")) {
             if (Test-Path $file) {
+              Write-Host "===== Fichier : $file ====="
               Get-Content $file
             }
           }
@@ -489,17 +550,6 @@ jobs:
               docker rm -f $container
             }
           }
-
-      - name: Archiver les résultats
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: resilience-tests-logs
-          path: |
-            s3-startup.log
-            run1.log
-            run2.log
-          if-no-files-found: ignore
 
   # =====================================================
   # JOB 5 - DOCKER BUILD
