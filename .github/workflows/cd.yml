@@ -2,12 +2,14 @@
 name: Financial Data Pipeline CD
 
 on:
+  workflow_dispatch:
+
   workflow_run:
     workflows: ["Financial Data Pipeline CI"]
-    types: [completed]
-    branches: [main]
-
-  workflow_dispatch:
+    types:
+      - completed
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -17,450 +19,518 @@ concurrency:
   group: financial-pipeline-production
   cancel-in-progress: false
 
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  VM_APP_DIR: /home/ubuntu/financial-pipeline/runtime
+
 jobs:
 
-  # =====================================================
-  # JOB 1 - VALIDATE ENVIRONMENT
-  # =====================================================
+  # --------------------------------------------------
+  # 1. VALIDATION DE L'ENVIRONNEMENT
+  # --------------------------------------------------
   validate:
-    name: "1 - Validate Environment"
-
-    if: >-
-      ${{
-        github.event_name == 'workflow_dispatch' ||
-        (
-          github.event.workflow_run.conclusion == 'success' &&
-          github.event.workflow_run.head_branch == 'main'
-        )
-      }}
-
+    name: Validate Environment
     runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 10
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-
-      - name: Vérifier Python 3.11
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          py -3.11 --version
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Python 3.11 est obligatoire"
-          }
-
-      - name: Vérifier Docker
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          docker --version
-          if ($LASTEXITCODE -ne 0) {
-            throw "Docker indisponible"
-          }
-
-          docker compose version
-          if ($LASTEXITCODE -ne 0) {
-            throw "Docker Compose indisponible"
-          }
-
-          $engine = docker info --format '{{.OSType}}'
-
-          if ($LASTEXITCODE -ne 0 -or $engine -ne "linux") {
-            throw "Docker doit utiliser les conteneurs Linux"
-          }
-
-      - name: Vérifier les fichiers
-        shell: powershell
-        run: |
-          if (!(Test-Path "Dockerfile")) {
-            throw "Dockerfile introuvable"
-          }
-
-          if (!(Test-Path "docker-compose.prod.yml")) {
-            throw "docker-compose.prod.yml introuvable"
-          }
-
-      - name: Vérifier les secrets
-        shell: powershell
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-          VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
-          POSTGRES_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
-        run: |
-          if (!$env:VM_HOST) { throw "VM_HOST manquant" }
-          if (!$env:VM_USER) { throw "VM_USER manquant" }
-          if (!$env:VM_PASSWORD) { throw "VM_PASSWORD manquant" }
-          if (!$env:POSTGRES_PASSWORD) {
-            throw "PROD_POSTGRES_PASSWORD manquant"
-          }
-
-          Write-Host "Tous les contrôles sont validés."
-
-  # =====================================================
-  # JOB 2 - BUILD AND PUBLISH
-  # =====================================================
-  build-publish:
-    name: "2 - Build & Publish Docker Image"
-
-    needs: validate
-
-    runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 40
 
     outputs:
       image: ${{ steps.meta.outputs.image }}
       tag: ${{ steps.meta.outputs.tag }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      - name: Définir les métadonnées
+      - name: Check required tools and secrets
+        shell: powershell
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+          PROD_POSTGRES_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+            throw "Docker n'est pas installé ou accessible."
+          }
+
+          if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+            throw "Python est introuvable."
+          }
+
+          $dockerOS = docker info --format '{{.OSType}}'
+          if ($dockerOS -ne "linux") {
+            throw "Docker Desktop doit utiliser les conteneurs Linux."
+          }
+
+          $required = @(
+            "VM_HOST",
+            "VM_USER",
+            "VM_PASSWORD",
+            "PROD_POSTGRES_PASSWORD",
+            "GHCR_TOKEN"
+          )
+
+          foreach ($name in $required) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrWhiteSpace($value)) {
+              throw "Secret GitHub manquant : $name"
+            }
+          }
+
+          Write-Host "Environnement validé."
+
+      - name: Generate image metadata
         id: meta
         shell: powershell
         run: |
-          $image = ("ghcr.io/${{ github.repository }}").ToLowerInvariant()
-          $tag = "${{ github.event.workflow_run.head_sha || github.sha }}"
+          $ErrorActionPreference = "Stop"
 
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "image=$image"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag"
+          $image = "ghcr.io/${{ github.repository }}".ToLower()
+          $sha = "${{ github.event.workflow_run.head_sha || github.sha }}"
+          $tag = $sha.Substring(0, 12)
+
+          "image=$image" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
           Write-Host "Image : $image"
           Write-Host "Tag : $tag"
 
-      - name: Connexion à GHCR
+      - name: Verify production files
         shell: powershell
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_ACTOR: ${{ github.actor }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $env:GHCR_TOKEN | docker login ghcr.io `
-            --username $env:GITHUB_ACTOR `
-            --password-stdin
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Connexion à GHCR échouée"
+          if (-not (Test-Path "Dockerfile")) {
+            throw "Dockerfile introuvable à la racine du dépôt."
           }
 
-      - name: Construire l'image Docker
-        shell: powershell
-        env:
-          IMAGE: ${{ steps.meta.outputs.image }}
-          TAG: ${{ steps.meta.outputs.tag }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          docker build --platform linux/amd64 `
-            -t "$env:IMAGE`:$env:TAG" `
-            -t "$env:IMAGE`:latest" .
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Construction Docker échouée"
+          if (-not (Test-Path "docker-compose.prod.yml")) {
+            throw "docker-compose.prod.yml introuvable à la racine du dépôt."
           }
 
-      - name: Publier sur GHCR
-        shell: powershell
-        env:
-          IMAGE: ${{ steps.meta.outputs.image }}
-          TAG: ${{ steps.meta.outputs.tag }}
-        run: |
-          $ErrorActionPreference = "Stop"
+          Write-Host "Fichiers de production présents."
 
-          docker push "$env:IMAGE`:$env:TAG"
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Publication de l'image versionnée échouée"
-          }
-
-          docker push "$env:IMAGE`:latest"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Publication de latest échouée"
-          }
-
-      - name: Résumé de publication
-        shell: powershell
-        run: |
-          "## Docker Image Published" >> $env:GITHUB_STEP_SUMMARY
-          "Image: ${{ steps.meta.outputs.image }}" >> $env:GITHUB_STEP_SUMMARY
-          "Tag: ${{ steps.meta.outputs.tag }}" >> $env:GITHUB_STEP_SUMMARY
-
-  # =====================================================
-  # JOB 3 - PREPARE VPS
-  # =====================================================
-  prepare-vps:
-    name: "3 - Prepare Production VPS"
-
-    needs: build-publish
-
+  # --------------------------------------------------
+  # 2. BUILD DE L'IMAGE DOCKER
+  # --------------------------------------------------
+  build-image:
+    name: Build Docker Image
     runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 15
+    needs: validate
 
-    environment: production
+    outputs:
+      image: ${{ needs.validate.outputs.image }}
+      tag: ${{ needs.validate.outputs.tag }}
 
     steps:
-      - name: Installer Paramiko
-        shell: powershell
-        run: |
-          py -3.11 -m pip install paramiko
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Installation de Paramiko échouée"
-          }
-
-      - name: Tester la connexion SSH
-        shell: powershell
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-          VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
-        run: |
-          @'
-          import os
-          import sys
-          import paramiko
-
-          client = paramiko.SSHClient()
-          client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-          try:
-              client.connect(
-                  hostname=os.environ["VM_HOST"],
-                  username=os.environ["VM_USER"],
-                  password=os.environ["VM_PASSWORD"],
-                  look_for_keys=False,
-                  allow_agent=False,
-                  timeout=20,
-                  auth_timeout=20
-              )
-
-              command = "whoami && docker --version && docker compose version"
-              stdin, stdout, stderr = client.exec_command(command)
-
-              output = stdout.read().decode()
-              error = stderr.read().decode()
-              status = stdout.channel.recv_exit_status()
-
-              print(output)
-
-              if error:
-                  print(error, file=sys.stderr)
-
-              if status != 0:
-                  raise RuntimeError("Vérification du VPS échouée")
-
-              print("SSH_CONNECTION_OK")
-
-          finally:
-              client.close()
-          '@ | py -3.11 -
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Connexion SSH échouée"
-          }
-
-      - name: Résumé VPS
-        shell: powershell
-        run: |
-          "## VPS Ready" >> $env:GITHUB_STEP_SUMMARY
-          "SSH authentication successful." >> $env:GITHUB_STEP_SUMMARY
-          "Docker and Docker Compose available." >> $env:GITHUB_STEP_SUMMARY
-
-  # =====================================================
-  # JOB 4 - DEPLOY AND VERIFY
-  # =====================================================
-  deploy:
-    name: "4 - Deploy & Verify Production"
-
-    needs:
-      - build-publish
-      - prepare-vps
-
-    runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 30
-
-    environment: production
-
-    steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      - name: Installer Paramiko
+      - name: Build Docker image
         shell: powershell
+        env:
+          IMAGE: ${{ needs.validate.outputs.image }}
+          TAG: ${{ needs.validate.outputs.tag }}
         run: |
-          py -3.11 -m pip install paramiko
+          $ErrorActionPreference = "Stop"
+
+          docker build `
+            --platform linux/amd64 `
+            -t "$env:IMAGE`:$env:TAG" `
+            -t "$env:IMAGE`:latest" .
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Installation de Paramiko échouée"
+            throw "Échec du build Docker."
           }
 
-      - name: Déployer et vérifier
+          docker images "$env:IMAGE"
+
+      - name: Save Docker image
+        shell: powershell
+        env:
+          IMAGE: ${{ needs.validate.outputs.image }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          docker save `
+            -o image.tar `
+            "$env:IMAGE`:$env:TAG" `
+            "$env:IMAGE`:latest"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Impossible de sauvegarder l'image Docker."
+          }
+
+          if (-not (Test-Path "image.tar")) {
+            throw "Le fichier image.tar n'a pas été créé."
+          }
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: financial-pipeline-image
+          path: image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+
+  # --------------------------------------------------
+  # 3. PUSH DE L'IMAGE VERS GHCR
+  # --------------------------------------------------
+  push-image:
+    name: Push Docker Image to GHCR
+    runs-on: [self-hosted, Windows, X64]
+    needs: [validate, build-image]
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: financial-pipeline-image
+          path: .
+
+      - name: Load Docker image
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          docker load -i image.tar
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Impossible de charger l'image Docker."
+          }
+
+      - name: Login to GitHub Container Registry
+        shell: powershell
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $env:GHCR_TOKEN |
+            docker login ghcr.io `
+              --username $env:GHCR_USER `
+              --password-stdin
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Connexion à GHCR échouée. Vérifie GHCR_TOKEN et les accès du package."
+          }
+
+      - name: Push version and latest images
+        shell: powershell
+        env:
+          IMAGE: ${{ needs.validate.outputs.image }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          docker push "$env:IMAGE`:$env:TAG"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Échec du push de l'image versionnée."
+          }
+
+          docker push "$env:IMAGE`:latest"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Échec du push de l'image latest."
+          }
+
+          Write-Host "Images publiées sur GHCR."
+
+      - name: Logout from GHCR
+        if: always()
+        shell: powershell
+        run: |
+          docker logout ghcr.io
+
+
+  # --------------------------------------------------
+  # 4. PRÉPARATION DE LA VM UBUNTU
+  # --------------------------------------------------
+  prepare-vps:
+    name: Prepare Production VPS
+    runs-on: [self-hosted, Windows, X64]
+    needs: [validate, push-image]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Install Paramiko
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade paramiko
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installation de Paramiko échouée."
+          }
+
+      - name: Prepare production directory on VPS
         shell: powershell
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
           VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
-          POSTGRES_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_ACTOR: ${{ github.actor }}
-          IMAGE: ${{ needs.build-publish.outputs.image }}
-          TAG: ${{ needs.build-publish.outputs.tag }}
+          VM_APP_DIR: ${{ env.VM_APP_DIR }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           @'
           import os
-          import sys
-          import shlex
           import paramiko
-
-          def dotenv_quote(value):
-              if "\n" in value or "\r" in value:
-                  raise ValueError("Valeur .env invalide")
-              return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+          import sys
 
           host = os.environ["VM_HOST"]
           user = os.environ["VM_USER"]
           password = os.environ["VM_PASSWORD"]
-          postgres_password = os.environ["POSTGRES_PASSWORD"]
-          ghcr_token = os.environ["GHCR_TOKEN"]
-          actor = os.environ["GITHUB_ACTOR"]
-          image = os.environ["IMAGE"]
-          tag = os.environ["TAG"]
-
-          deploy_dir = "/home/ubuntu/financial-pipeline/runtime"
+          app_dir = os.environ["VM_APP_DIR"]
 
           client = paramiko.SSHClient()
           client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-          def remote(command, input_text=None):
-              stdin, stdout, stderr = client.exec_command(command)
-
-              if input_text is not None:
-                  stdin.write(input_text)
-                  stdin.flush()
-                  stdin.channel.shutdown_write()
-
-              output = stdout.read().decode()
-              error = stderr.read().decode()
-              status = stdout.channel.recv_exit_status()
-
-              if output:
-                  print(output)
-
-              if error:
-                  print(error, file=sys.stderr)
-
-              if status != 0:
-                  raise RuntimeError(
-                      f"Commande distante échouée : code {status}"
-                  )
-
           try:
-              print("Connexion au VPS...")
-
               client.connect(
                   hostname=host,
                   username=user,
                   password=password,
-                  look_for_keys=False,
-                  allow_agent=False,
                   timeout=20,
-                  auth_timeout=20
+                  look_for_keys=False,
+                  allow_agent=False
               )
 
-              print("Préparation du dossier...")
-              remote("mkdir -p " + shlex.quote(deploy_dir))
+              commands = [
+                  "mkdir -p " + app_dir,
+                  "docker --version",
+                  "docker compose version"
+              ]
 
-              sftp = client.open_sftp()
+              for command in commands:
+                  stdin, stdout, stderr = client.exec_command(command)
+                  exit_code = stdout.channel.recv_exit_status()
 
-              print("Transfert de Docker Compose...")
-              sftp.put(
-                  "docker-compose.prod.yml",
-                  deploy_dir + "/docker-compose.prod.yml"
-              )
+                  output = stdout.read().decode()
+                  error = stderr.read().decode()
 
-              env_content = "\n".join([
-                  "POSTGRES_PASSWORD=" + dotenv_quote(postgres_password),
-                  "PIPELINE_IMAGE=" + dotenv_quote(image + ":" + tag),
-                  "SCHEDULE_SECONDS=300",
-                  "S3_ACCESS_KEY=minioadmin",
-                  "S3_SECRET_KEY=minioadminpassword",
-                  "S3_BUCKET=transactions-bucket",
-                  ""
-              ])
+                  print(output)
 
-              with sftp.file(deploy_dir + "/.env", "w") as env_file:
-                  env_file.write(env_content)
+                  if exit_code != 0:
+                      print(error, file=sys.stderr)
+                      raise RuntimeError("Commande distante échouée : " + command)
 
-              sftp.chmod(deploy_dir + "/.env", 0o600)
-              sftp.close()
-
-              print("Connexion à GHCR...")
-
-              login_command = (
-                  "docker login ghcr.io -u "
-                  + shlex.quote(actor)
-                  + " --password-stdin"
-              )
-
-              remote(login_command, ghcr_token + "\n")
-
-              script = f"""
-          set -euo pipefail
-
-          cd {shlex.quote(deploy_dir)}
-
-          echo "Validation Docker Compose..."
-          docker compose -p financial-pipeline -f docker-compose.prod.yml config -q
-
-          echo "Téléchargement des images..."
-          docker compose -p financial-pipeline -f docker-compose.prod.yml pull scheduler postgres s3
-
-          echo "Démarrage des services..."
-          docker compose -p financial-pipeline -f docker-compose.prod.yml up -d
-
-          echo "Déconnexion GHCR..."
-          docker logout ghcr.io || true
-
-          echo "État des services..."
-          docker compose -p financial-pipeline -f docker-compose.prod.yml ps
-
-          echo "Derniers logs du scheduler..."
-          docker compose -p financial-pipeline -f docker-compose.prod.yml logs --tail=40 scheduler
-
-          echo "DEPLOYMENT_SUCCESS"
-          """
-
-              print("Déploiement en cours...")
-              remote("bash -s", script)
-
-              print("Déploiement terminé avec succès.")
+              print("VM prête pour le déploiement.")
 
           finally:
               client.close()
-          '@ | py -3.11 -
+          '@ | Set-Content -Path deploy_prepare.py -Encoding UTF8
+
+          python deploy_prepare.py
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Le déploiement a échoué"
+            throw "La préparation de la VM a échoué."
           }
 
-      - name: Résumé final
-        if: success()
+
+  # --------------------------------------------------
+  # 5. DÉPLOIEMENT ET VÉRIFICATION
+  # --------------------------------------------------
+  deploy:
+    name: Deploy and Verify Production
+    runs-on: [self-hosted, Windows, X64]
+    needs: [validate, build-image, push-image, prepare-vps]
+
+    environment: production
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Install Paramiko
         shell: powershell
         run: |
-          "## Production Deployment Successful" >> $env:GITHUB_STEP_SUMMARY
-          "Image: ${{ needs.build-publish.outputs.image }}:${{ needs.build-publish.outputs.tag }}" >> $env:GITHUB_STEP_SUMMARY
-          "Deployment: /home/ubuntu/financial-pipeline/runtime" >> $env:GITHUB_STEP_SUMMARY
-          "Scheduler interval: 300 seconds" >> $env:GITHUB_STEP_SUMMARY
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade paramiko
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installation de Paramiko échouée."
+          }
+
+      - name: Deploy application on Ubuntu VPS
+        shell: powershell
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          IMAGE: ${{ needs.validate.outputs.image }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VM_APP_DIR: ${{ env.VM_APP_DIR }}
+          POSTGRES_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          @'
+          import os
+          import paramiko
+          import sys
+          import time
+
+          host = os.environ["VM_HOST"]
+          user = os.environ["VM_USER"]
+          password = os.environ["VM_PASSWORD"]
+          token = os.environ["GHCR_TOKEN"]
+          ghcr_user = os.environ["GHCR_USER"]
+          app_dir = os.environ["VM_APP_DIR"]
+
+          image = os.environ["IMAGE"]
+          tag = os.environ["TAG"]
+          postgres_password = os.environ["POSTGRES_PASSWORD"]
+
+          client = paramiko.SSHClient()
+          client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+          def run_command(command, input_data=None):
+              stdin, stdout, stderr = client.exec_command(command, timeout=300)
+
+              if input_data is not None:
+                  stdin.write(input_data)
+                  stdin.flush()
+                  stdin.channel.shutdown_write()
+
+              exit_code = stdout.channel.recv_exit_status()
+              output = stdout.read().decode(errors="replace")
+              error = stderr.read().decode(errors="replace")
+
+              if output:
+                  print(output)
+
+              if exit_code != 0:
+                  print(error, file=sys.stderr)
+                  raise RuntimeError("Commande distante échouée : " + command)
+
+              return output
+
+          try:
+              client.connect(
+                  hostname=host,
+                  username=user,
+                  password=password,
+                  timeout=20,
+                  look_for_keys=False,
+                  allow_agent=False
+              )
+
+              sftp = client.open_sftp()
+
+              # Transfert du fichier Compose
+              local_compose = "docker-compose.prod.yml"
+              remote_compose = app_dir + "/docker-compose.prod.yml"
+
+              sftp.put(local_compose, remote_compose)
+
+              # Création du fichier .env
+              env_content = (
+                  "POSTGRES_PASSWORD=" + postgres_password + "\n"
+                  "PIPELINE_IMAGE=" + image + ":" + tag + "\n"
+                  "SCHEDULE_SECONDS=300\n"
+                  "S3_ACCESS_KEY=minioadmin\n"
+                  "S3_SECRET_KEY=minioadminpassword\n"
+                  "S3_BUCKET=transactions-bucket\n"
+              )
+
+              with sftp.file(app_dir + "/.env", "w") as env_file:
+                  env_file.write(env_content)
+
+              run_command("chmod 600 " + app_dir + "/.env")
+              sftp.close()
+
+              # Connexion GHCR sur le serveur
+              run_command(
+              "docker login ghcr.io -u " + repr(ghcr_user) + " --password-stdin",
+              token + "\n"
+                    )
+
+              # Vérification Compose
+              run_command(
+                  "cd " + app_dir +
+                  " && docker compose -p financial-pipeline "
+                  "-f docker-compose.prod.yml config -q"
+              )
+
+              # Récupération des images nécessaires
+              run_command(
+                  "cd " + app_dir +
+                  " && docker compose -p financial-pipeline "
+                  "-f docker-compose.prod.yml pull"
+              )
+
+              # Déploiement
+              run_command(
+                  "cd " + app_dir +
+                  " && docker compose -p financial-pipeline "
+                  "-f docker-compose.prod.yml up -d"
+              )
+
+              time.sleep(10)
+
+              # Vérification de l'état des conteneurs
+              run_command(
+                  "cd " + app_dir +
+                  " && docker compose -p financial-pipeline "
+                  "-f docker-compose.prod.yml ps"
+              )
+
+              run_command(
+                  "cd " + app_dir +
+                  " && docker compose -p financial-pipeline "
+                  "-f docker-compose.prod.yml logs --tail=40 scheduler"
+              )
+
+              run_command("docker logout ghcr.io")
+
+              print("Déploiement terminé.")
+
+          finally:
+              client.close()
+          '@ | Set-Content -Path deploy_production.py -Encoding UTF8
+
+          python deploy_production.py
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Le déploiement en production a échoué."
+          }
+
+      - name: Deployment summary
+        if: success()
+        shell: powershell
+        env:
+          IMAGE: ${{ needs.validate.outputs.image }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          Write-Host "======================================"
+          Write-Host "DEPLOIEMENT PRODUCTION REUSSI"
+          Write-Host "Image : $env:IMAGE"
+          Write-Host "Tag : $env:TAG"
+          Write-Host "Serveur : ${{ secrets.VM_HOST }}"
+          Write-Host "======================================"
