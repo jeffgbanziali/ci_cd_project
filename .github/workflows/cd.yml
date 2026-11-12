@@ -4,6 +4,12 @@ name: Financial Data Pipeline CD
 on:
   workflow_dispatch:
 
+  workflow_run:
+    workflows: ["Financial Data Pipeline CI"]
+    types:
+      - completed
+    branches:
+      - main
 permissions:
   contents: read
 
@@ -22,6 +28,7 @@ jobs:
   # ==========================================
   validate:
     name: Validate Environment
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: [self-hosted, Windows, X64]
 
     outputs:
@@ -31,6 +38,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       - name: Check environment and secrets
         shell: powershell
@@ -55,12 +64,10 @@ jobs:
             }
           }
 
-          if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-            throw "Docker introuvable."
-          }
-
-          if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-            throw "Python introuvable."
+          foreach ($tool in @("docker", "python", "terraform")) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              throw "$tool est introuvable sur le runner."
+            }
           }
 
           $dockerOS = docker info --format '{{.OSType}}'
@@ -69,6 +76,7 @@ jobs:
             throw "Docker doit fonctionner en mode Linux."
           }
 
+          terraform version
           Write-Host "Environnement valide."
 
       - name: Generate image metadata
@@ -92,16 +100,20 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if (-not (Test-Path "Dockerfile")) {
-            throw "Dockerfile introuvable à la racine."
-          }
+          $files = @(
+            "Dockerfile",
+            "docker-compose.prod.yml",
+            "terraform/main.tf",
+            "terraform/variables.tf"
+          )
 
-          if (-not (Test-Path "docker-compose.prod.yml")) {
-            throw "docker-compose.prod.yml introuvable à la racine."
+          foreach ($file in $files) {
+            if (-not (Test-Path $file)) {
+              throw "Fichier introuvable : $file"
+            }
           }
 
           Write-Host "Fichiers de production vérifiés."
-
 
   # ==========================================
   # 2. BUILD + TRANSFERT + DEPLOIEMENT
@@ -116,6 +128,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       # --------------------------------------
       # BUILD DOCKER
@@ -180,9 +194,9 @@ jobs:
           }
 
       # --------------------------------------
-      # TRANSFERT ET DEPLOIEMENT AZURE
+      # TRANSFERT VERS LA VM
       # --------------------------------------
-      - name: Transfer image and deploy
+      - name: Transfer image and configuration
         shell: powershell
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
@@ -199,7 +213,6 @@ jobs:
           import os
           import sys
           import shlex
-          import time
           import paramiko
 
           host = os.environ["VM_HOST"]
@@ -212,10 +225,6 @@ jobs:
           postgres_password = os.environ["POSTGRES_PASSWORD"]
 
           client = paramiko.SSHClient()
-
-          # Accepte automatiquement la première clé d'hôte.
-          # Pour la production, il est préférable de vérifier
-          # et épingler la clé SSH de la VM.
           client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
           def run_command(command):
@@ -244,7 +253,7 @@ jobs:
               return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
           try:
-              print("Connexion à la VM Azure...")
+              print("Connexion à la VM...")
 
               client.connect(
                   hostname=host,
@@ -293,52 +302,15 @@ jobs:
 
               print("Transfert terminé.")
 
-              # 4. Charger l'image Docker sur Azure
-              print("Chargement de l'image Docker sur Azure...")
+              # 4. Charger l'image sur la VM
+              print("Chargement de l'image Docker...")
 
               run_command(
                   "cd " + safe_dir +
                   " && docker load -i image.tar"
               )
 
-              # 5. Vérifier la configuration Compose
-              compose = (
-                  "docker compose -p financial-pipeline "
-                  "-f docker-compose.prod.yml"
-              )
-
-              run_command(
-                  "cd " + safe_dir +
-                  " && " + compose + " config -q"
-              )
-
-              print("Configuration Docker Compose valide.")
-
-              # 6. Déployer les services
-              print("Démarrage des services...")
-
-              run_command(
-                  "cd " + safe_dir +
-                  " && " + compose + " up -d --no-build"
-              )
-
-              time.sleep(10)
-
-              # 7. Vérifier les conteneurs
-              print("Vérification des conteneurs...")
-
-              run_command(
-                  "cd " + safe_dir +
-                  " && " + compose + " ps"
-              )
-
-              # 8. Vérifier les logs du scheduler
-              run_command(
-                  "cd " + safe_dir +
-                  " && " + compose + " logs --tail=40 scheduler"
-              )
-
-              print("DEPLOIEMENT TERMINE AVEC SUCCES.")
+              print("Image Docker chargée avec succès.")
 
           finally:
               client.close()
@@ -347,8 +319,45 @@ jobs:
           python deploy_production.py
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Le déploiement Azure a échoué."
+            throw "Le transfert vers la VM a échoué."
           }
+
+      # --------------------------------------
+      # TERRAFORM : DEPLOIEMENT PRODUCTION
+      # --------------------------------------
+      - name: Terraform init
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          terraform -chdir=terraform init -input=false
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Terraform init a échoué."
+          }
+
+      - name: Terraform apply
+        shell: powershell
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          terraform -chdir=terraform apply `
+            -auto-approve `
+            -input=false `
+            -var="ssh_host=$env:VM_HOST" `
+            -var="ssh_user=$env:VM_USER" `
+            -var="ssh_password=$env:VM_PASSWORD" `
+            -var="deploy_revision=${{ github.sha }}"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Terraform apply a échoué."
+          }
+
+          Write-Host "Déploiement Terraform terminé."
 
       # --------------------------------------
       # RESUME DU DEPLOIEMENT
@@ -365,4 +374,5 @@ jobs:
           Write-Host "Image : $env:IMAGE"
           Write-Host "Tag : $env:TAG"
           Write-Host "Serveur : ${{ secrets.VM_HOST }}"
+          Write-Host "Terraform : applique avec succes"
           Write-Host "======================================"

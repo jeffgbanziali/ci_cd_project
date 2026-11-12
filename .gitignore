@@ -14,3 +14,10 @@ data_generated/
 
 # Secrets
 .env
+.env.*
+!.env.example
+
+.terraform/
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfvars
