@@ -14,12 +14,18 @@ permissions:
   packages: write
 
 jobs:
+
+  # ==========================================
+  # JOB 3 : BUILD & PUBLISH
+  # ==========================================
   build-publish:
     name: "3 - Build & Publish Docker Image"
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+
     outputs:
       image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
 
     steps:
       - name: Checkout
@@ -27,17 +33,19 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      - name: Définir le nom de l'image
+      - name: Définir les métadonnées
         id: meta
         run: |
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          TAG="${{ github.event.workflow_run.head_sha || github.sha }}"
+
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-          echo "Image : $IMAGE"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Configurer Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Connexion à GitHub Container Registry
+      - name: Connexion à GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -52,8 +60,11 @@ jobs:
           platforms: linux/amd64
           tags: |
             ${{ steps.meta.outputs.image }}:latest
-            ${{ steps.meta.outputs.image }}:${{ github.event.workflow_run.head_sha || github.sha }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
 
+  # ==========================================
+  # JOB 4 : DEPLOIEMENT VPS
+  # ==========================================
   deploy:
     name: "4 - Deploy to VPS"
     needs: build-publish
@@ -78,7 +89,7 @@ jobs:
           test -n "$VM_SSH_KEY" || (echo "VM_SSH_KEY manquant" && exit 1)
           test -n "$POSTGRES_PASSWORD" || (echo "PROD_POSTGRES_PASSWORD manquant" && exit 1)
 
-      - name: Préparer la connexion SSH
+      - name: Préparer SSH
         env:
           VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
         run: |
@@ -86,17 +97,26 @@ jobs:
           printf '%s\n' "$VM_SSH_KEY" > deploy_key
           ssh-keygen -y -f deploy_key > /dev/null
 
-      - name: Copier le fichier Docker Compose
+      - name: Ajouter le VPS aux hôtes connus
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts
 
+      - name: Préparer le dossier distant
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
           ssh -i deploy_key "$VM_USER@$VM_HOST" \
             "mkdir -p /home/ubuntu/financial-pipeline/runtime"
 
+      - name: Copier Docker Compose
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
           scp -i deploy_key docker-compose.prod.yml \
             "$VM_USER@$VM_HOST:/home/ubuntu/financial-pipeline/runtime/docker-compose.prod.yml"
 
@@ -108,15 +128,16 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_ACTOR: ${{ github.actor }}
           IMAGE: ${{ needs.build-publish.outputs.image }}
+          TAG: ${{ needs.build-publish.outputs.tag }}
+
         run: |
           set -euo pipefail
 
           POSTGRES_PASSWORD_B64=$(printf '%s' "$POSTGRES_PASSWORD" | base64 -w0)
           GHCR_TOKEN_B64=$(printf '%s' "$GHCR_TOKEN" | base64 -w0)
 
-          ssh -i deploy_key \
-            "$VM_USER@$VM_HOST" \
-            "POSTGRES_PASSWORD_B64=$POSTGRES_PASSWORD_B64 GHCR_TOKEN_B64=$GHCR_TOKEN_B64 IMAGE=$IMAGE GITHUB_ACTOR=$GITHUB_ACTOR bash -s" <<'REMOTE'
+          ssh -i deploy_key "$VM_USER@$VM_HOST" \
+            "POSTGRES_PASSWORD_B64=$POSTGRES_PASSWORD_B64 GHCR_TOKEN_B64=$GHCR_TOKEN_B64 IMAGE=$IMAGE TAG=$TAG GITHUB_ACTOR=$GITHUB_ACTOR bash -s" <<'REMOTE'
 
           set -euo pipefail
 
@@ -126,8 +147,9 @@ jobs:
           GHCR_TOKEN=$(printf '%s' "$GHCR_TOKEN_B64" | base64 -d)
 
           umask 077
-          printf 'POSTGRES_PASSWORD=%s\nPIPELINE_IMAGE=%s\nSCHEDULE_SECONDS=300\n' \
-            "$POSTGRES_PASSWORD" "$IMAGE" > .env
+
+          printf 'POSTGRES_PASSWORD=%s\nPIPELINE_IMAGE=%s:%s\nSCHEDULE_SECONDS=300\n' \
+            "$POSTGRES_PASSWORD" "$IMAGE" "$TAG" > .env
 
           echo "$GHCR_TOKEN" | docker login ghcr.io \
             -u "$GITHUB_ACTOR" --password-stdin
