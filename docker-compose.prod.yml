@@ -10,9 +10,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test:
-        - CMD-SHELL
-        - pg_isready -U pipeline_user -d financial_db
+      test: ["CMD-SHELL", "pg_isready -U pipeline_user -d financial_db"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -23,18 +21,22 @@ services:
     image: chrislusf/seaweedfs:latest
     restart: unless-stopped
     command: ["server", "-s3", "-dir=/data"]
+    ports:
+      - "127.0.0.1:59000:8333"
     volumes:
       - s3data:/data
     networks:
       - financial-network
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - wget -q --spider http://localhost:8333/ || exit 1
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles:
+      - slm
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - financial-network
 
   scheduler:
     image: ${PIPELINE_IMAGE:?PIPELINE_IMAGE est obligatoire}
@@ -44,13 +46,15 @@ services:
       postgres:
         condition: service_healthy
       s3:
-        condition: service_healthy
+        condition: service_started
     environment:
       DB_URL: postgresql://pipeline_user:${POSTGRES_PASSWORD}@postgres:5432/financial_db
       S3_ENDPOINT: http://s3:8333
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
       S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadminpassword}
       S3_BUCKET: ${S3_BUCKET:-transactions-bucket}
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:1.5b}
       RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-5}
       RETRY_WAIT_SECONDS: ${RETRY_WAIT_SECONDS:-2}
     networks:
@@ -59,6 +63,7 @@ services:
 volumes:
   pgdata:
   s3data:
+  ollama_data:
 
 networks:
   financial-network:

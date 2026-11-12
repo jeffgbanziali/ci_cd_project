@@ -13,18 +13,21 @@ permissions:
   contents: read
   packages: write
 
-jobs:
+concurrency:
+  group: financial-pipeline-production
+  cancel-in-progress: false
 
-  # =====================================================
-  # JOB 6 - BUILD AND PUBLISH
-  # =====================================================
+jobs:
   build-publish:
     name: "6 - Build & Publish Docker Image"
 
     if: >-
       ${{
         github.event_name == 'workflow_dispatch' ||
-        github.event.workflow_run.conclusion == 'success'
+        (
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_branch == 'main'
+        )
       }}
 
     runs-on: ubuntu-latest
@@ -79,9 +82,6 @@ jobs:
           echo "Image: ${{ steps.meta.outputs.image }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Tag: ${{ steps.meta.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
 
-  # =====================================================
-  # JOB 7 - DEPLOY TO PRODUCTION
-  # =====================================================
   deploy:
     name: "7 - Deploy to Production VPS"
 
@@ -102,54 +102,79 @@ jobs:
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
-          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
           POSTGRES_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
         run: |
+          set -euo pipefail
+
           test -n "$VM_HOST" || { echo "VM_HOST manquant"; exit 1; }
           test -n "$VM_USER" || { echo "VM_USER manquant"; exit 1; }
-          test -n "$VM_SSH_KEY" || { echo "VM_SSH_KEY manquant"; exit 1; }
+          test -n "$VM_PASSWORD" || { echo "VM_PASSWORD manquant"; exit 1; }
           test -n "$POSTGRES_PASSWORD" || { echo "PROD_POSTGRES_PASSWORD manquant"; exit 1; }
 
-      - name: Préparer SSH
-        env:
-          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+      - name: Installer sshpass
         run: |
-          install -m 600 /dev/null deploy_key
-          printf '%s\n' "$VM_SSH_KEY" > deploy_key
-          ssh-keygen -y -f deploy_key > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y sshpass
 
-      - name: Ajouter le VPS aux hôtes connus
+      - name: Préparer les hôtes SSH
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
         run: |
+          set -euo pipefail
+
           mkdir -p ~/.ssh
           ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
 
       - name: Vérifier la connexion SSH
         env:
+          SSHPASS: ${{ secrets.VM_PASSWORD }}
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
         run: |
-          ssh -i deploy_key "$VM_USER@$VM_HOST" "echo SSH_CONNECTION_OK"
+          set -euo pipefail
+
+          sshpass -e ssh \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            -o StrictHostKeyChecking=yes \
+            "$VM_USER@$VM_HOST" \
+            "whoami && docker --version && docker compose version"
 
       - name: Préparer le dossier de production
         env:
+          SSHPASS: ${{ secrets.VM_PASSWORD }}
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
         run: |
-          ssh -i deploy_key "$VM_USER@$VM_HOST" \
+          set -euo pipefail
+
+          sshpass -e ssh \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            -o StrictHostKeyChecking=yes \
+            "$VM_USER@$VM_HOST" \
             "mkdir -p /home/ubuntu/financial-pipeline/runtime"
 
       - name: Copier Docker Compose
         env:
+          SSHPASS: ${{ secrets.VM_PASSWORD }}
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
         run: |
-          scp -i deploy_key docker-compose.prod.yml \
+          set -euo pipefail
+
+          sshpass -e scp \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            -o StrictHostKeyChecking=yes \
+            docker-compose.prod.yml \
             "$VM_USER@$VM_HOST:/home/ubuntu/financial-pipeline/runtime/docker-compose.prod.yml"
 
       - name: Déployer les services
         env:
+          SSHPASS: ${{ secrets.VM_PASSWORD }}
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
           POSTGRES_PASSWORD: ${{ secrets.PROD_POSTGRES_PASSWORD }}
@@ -158,51 +183,72 @@ jobs:
           IMAGE: ${{ needs.build-publish.outputs.image }}
           TAG: ${{ needs.build-publish.outputs.tag }}
 
+        shell: bash
+
         run: |
           set -euo pipefail
 
           POSTGRES_PASSWORD_B64=$(printf '%s' "$POSTGRES_PASSWORD" | base64 -w0)
           GHCR_TOKEN_B64=$(printf '%s' "$GHCR_TOKEN" | base64 -w0)
 
-          ssh -i deploy_key \
+          sshpass -e ssh \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            -o StrictHostKeyChecking=yes \
             "$VM_USER@$VM_HOST" \
             "POSTGRES_PASSWORD_B64=$POSTGRES_PASSWORD_B64 GHCR_TOKEN_B64=$GHCR_TOKEN_B64 IMAGE=$IMAGE TAG=$TAG GITHUB_ACTOR=$GITHUB_ACTOR bash -s" <<'REMOTE'
 
           set -euo pipefail
+          umask 077
 
-          cd /home/ubuntu/financial-pipeline/runtime
+          DEPLOY_DIR="/home/ubuntu/financial-pipeline/runtime"
+
+          cd "$DEPLOY_DIR"
 
           POSTGRES_PASSWORD=$(printf '%s' "$POSTGRES_PASSWORD_B64" | base64 -d)
           GHCR_TOKEN=$(printf '%s' "$GHCR_TOKEN_B64" | base64 -d)
 
-          umask 077
+          # Création du fichier d'environnement protégé
+          printf '%s\n' \
+            "POSTGRES_PASSWORD=$POSTGRES_PASSWORD" \
+            "PIPELINE_IMAGE=$IMAGE:$TAG" \
+            "SCHEDULE_SECONDS=300" \
+            "S3_ACCESS_KEY=minioadmin" \
+            "S3_SECRET_KEY=minioadminpassword" \
+            "S3_BUCKET=transactions-bucket" \
+            > .env
 
-          printf 'POSTGRES_PASSWORD=%s\nPIPELINE_IMAGE=%s:%s\nSCHEDULE_SECONDS=300\n' \
-            "$POSTGRES_PASSWORD" "$IMAGE" "$TAG" > .env
+          chmod 600 .env
 
-          echo "$GHCR_TOKEN" | docker login ghcr.io \
-            -u "$GITHUB_ACTOR" --password-stdin
+          # Authentification au registre Docker
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io \
+            -u "$GITHUB_ACTOR" \
+            --password-stdin
 
-          echo "Téléchargement des images..."
+          unset GHCR_TOKEN
 
+          # Validation de la configuration
           docker compose -p financial-pipeline \
-            -f docker-compose.prod.yml pull
+            -f docker-compose.prod.yml config -q
 
-          echo "Démarrage des services..."
+          # Téléchargement des images
+          docker compose -p financial-pipeline \
+            -f docker-compose.prod.yml pull scheduler postgres s3
 
+          # Démarrage / mise à jour des services
           docker compose -p financial-pipeline \
             -f docker-compose.prod.yml up -d
 
-          echo "Vérification des services..."
+          # Déconnexion du registre
+          docker logout ghcr.io
 
+          # Vérification
           docker compose -p financial-pipeline \
             -f docker-compose.prod.yml ps
 
-          REMOTE
+          echo "Déploiement terminé."
 
-      - name: Nettoyer la clé SSH
-        if: always()
-        run: rm -f deploy_key
+          REMOTE
 
       - name: Résumé du déploiement
         if: success()
@@ -210,3 +256,4 @@ jobs:
           echo "## Production Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
           echo "Image: ${{ needs.build-publish.outputs.image }}:${{ needs.build-publish.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Scheduler: 300 seconds" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deployment directory: /home/ubuntu/financial-pipeline/runtime" >> "$GITHUB_STEP_SUMMARY"
